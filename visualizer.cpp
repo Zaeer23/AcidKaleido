@@ -1,0 +1,3607 @@
+#define _USE_MATH_DEFINES
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <winhttp.h>
+#include <windows.h>
+#include <shellapi.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_mixer.h>
+#include <SDL2/SDL_ttf.h>
+#include <fftw3.h>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <iostream>
+#include <deque>
+#include <random>
+#include <commdlg.h>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+static constexpr int   FPS       = 60;
+static constexpr int   FFT_N     = 4096;
+static constexpr int   FREQ_BINS = FFT_N / 2;
+static constexpr int   KSLICES   = 8;
+static constexpr float SANG      = 2.f*(float)M_PI/KSLICES;
+
+static TTF_Font*  g_font    = nullptr;
+static TTF_Font*  g_fontSm  = nullptr;
+static float      g_pcmBuf[FFT_N*2]={};
+static int        g_pcmWrite=0;
+static SDL_mutex* g_pcmMutex=nullptr;
+
+void audioCaptureCallback(void*,Uint8* stream,int len){
+    int n=len/sizeof(float); SDL_LockMutex(g_pcmMutex);
+    float* f=(float*)stream;
+    for(int i=0;i<n;++i){g_pcmBuf[g_pcmWrite%(FFT_N*2)]=f[i];++g_pcmWrite;}
+    SDL_UnlockMutex(g_pcmMutex);
+}
+
+bool initFonts(){
+    const char* paths[]={
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/tahoma.ttf",
+        "C:/Windows/Fonts/verdana.ttf",
+        nullptr
+    };
+    for(int i=0;paths[i];++i){
+        g_font  =TTF_OpenFont(paths[i],15);
+        g_fontSm=TTF_OpenFont(paths[i],12);
+        if(g_font&&g_fontSm)return true;
+        if(g_font)  {TTF_CloseFont(g_font);  g_font=nullptr;}
+        if(g_fontSm){TTF_CloseFont(g_fontSm);g_fontSm=nullptr;}
+    }
+    return false;
+}
+
+void drawText(SDL_Renderer* r,TTF_Font* font,const std::string& text,
+              int x,int y,SDL_Color c,bool centered=false){
+    if(!font||text.empty())return;
+    SDL_Surface* surf=TTF_RenderText_Blended(font,text.c_str(),c);
+    if(!surf)return;
+    SDL_Texture* tex=SDL_CreateTextureFromSurface(r,surf);
+    SDL_FreeSurface(surf);
+    if(!tex)return;
+    int tw,th; SDL_QueryTexture(tex,nullptr,nullptr,&tw,&th);
+    SDL_Rect dst={centered?x-tw/2:x, y, tw, th};
+    SDL_SetTextureBlendMode(tex,SDL_BLENDMODE_BLEND);
+    SDL_SetTextureAlphaMod(tex,c.a);
+    SDL_RenderCopy(r,tex,nullptr,&dst);
+    SDL_DestroyTexture(tex);
+}
+
+std::string openFilePicker(){
+    char fn[MAX_PATH]={};OPENFILENAMEA ofn={};ofn.lStructSize=sizeof(ofn);
+    ofn.lpstrFilter="Audio Files\0*.mp3;*.ogg;*.wav;*.flac\0All Files\0*.*\0";
+    ofn.lpstrFile=fn;ofn.nMaxFile=MAX_PATH;ofn.lpstrTitle="Select a music file";
+    ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+    if(GetOpenFileNameA(&ofn))return std::string(fn);return"";
+}
+inline float lerp(float a,float b,float t){return a+(b-a)*t;}
+inline float clamp01(float x){return x<0?0:x>1?1:x;}
+inline float smoothstep(float x){x=clamp01(x);return x*x*(3-2*x);}
+// Spring easing: pronounced overshoot then settles — gives menu items a bouncy pop
+inline float springEase(float t){
+    t=clamp01(t);
+    return 1.f - expf(-5.5f*t)*cosf(t*14.f);
+}
+
+SDL_Color hsv(float h,float s,float v,float a=1.f){
+    h=fmod(h,360.f);if(h<0)h+=360.f;
+    float c=v*s,x=c*(1.f-fabsf(fmod(h/60.f,2.f)-1.f)),m=v-c;
+    float r=0,g=0,b=0;
+    if(h<60){r=c;g=x;}else if(h<120){r=x;g=c;}else if(h<180){g=c;b=x;}
+    else if(h<240){g=x;b=c;}else if(h<300){r=x;b=c;}else{r=c;b=x;}
+    return{(Uint8)((r+m)*255),(Uint8)((g+m)*255),(Uint8)((b+m)*255),(Uint8)(a*255)};
+}
+
+static Mix_Music* g_music=nullptr;static bool g_paused=false;
+static Uint32 g_lastTrackChange=0;
+static std::string g_exeDir; // set in main() — used by logErr before getExeDir is available
+void logErr(const std::string& msg){
+    std::ofstream f(g_exeDir+"audio_debug.txt",std::ios::app);
+    f<<msg<<"\n";
+}
+
+void loadAndPlay(const std::string& p){
+    if(g_music){Mix_HaltMusic();Mix_FreeMusic(g_music);g_music=nullptr;}
+    g_music=Mix_LoadMUS(p.c_str());
+    if(g_music){
+        int r=Mix_PlayMusic(g_music,-1);
+        g_paused=false;
+        if(r<0) logErr("Mix_PlayMusic failed ["+p+"]: "+Mix_GetError());
+    } else {
+        logErr("Mix_LoadMUS failed ["+p+"]: "+Mix_GetError());
+    }
+    g_lastTrackChange=SDL_GetTicks();
+}
+
+struct V2{float x,y;};
+V2 operator+(V2 a,V2 b){return{a.x+b.x,a.y+b.y};}
+V2 operator-(V2 a,V2 b){return{a.x-b.x,a.y-b.y};}
+V2 operator*(V2 a,float s){return{a.x*s,a.y*s};}
+V2 operator*(float s,V2 a){return{a.x*s,a.y*s};}
+float vlen(V2 v){return sqrtf(v.x*v.x+v.y*v.y);}
+V2 vnorm(V2 v){float l=vlen(v);return l>0?V2{v.x/l,v.y/l}:V2{0,0};}
+V2 perp(V2 v){return{-v.y,v.x};}
+V2 vrot(V2 v,float a){return{v.x*cosf(a)-v.y*sinf(a),v.x*sinf(a)+v.y*cosf(a)};}
+
+void triC(SDL_Renderer* r,V2 a,V2 b,V2 c,SDL_Color ca,SDL_Color cb,SDL_Color cc){
+    SDL_Vertex v[3]={{{a.x,a.y},ca,{0,0}},{{b.x,b.y},cb,{0,0}},{{c.x,c.y},cc,{0,0}}};
+    int i[]={0,1,2};SDL_RenderGeometry(r,nullptr,v,3,i,3);
+}
+void quadC(SDL_Renderer* r,V2 a,V2 b,V2 c,V2 d,SDL_Color ca,SDL_Color cb,SDL_Color cc,SDL_Color cd){
+    SDL_Vertex v[4]={{{a.x,a.y},ca,{0,0}},{{b.x,b.y},cb,{0,0}},{{c.x,c.y},cc,{0,0}},{{d.x,d.y},cd,{0,0}}};
+    int i[]={0,1,2,1,2,3};SDL_RenderGeometry(r,nullptr,v,4,i,6);
+}
+void stroke(SDL_Renderer* r,V2 p0,V2 p1,float lw,SDL_Color c0,SDL_Color c1){
+    if(vlen(p1-p0)<0.3f)return;
+    V2 d=vnorm(p1-p0),s=perp(d);
+    quadC(r,p0+s*lw,p0-s*lw,p1+s*lw,p1-s*lw,c0,c0,c1,c1);
+}
+void softCircle(SDL_Renderer* r,V2 c,float rad,SDL_Color col,SDL_Color edge,int seg=32){
+    for(int i=0;i<seg;++i){
+        float a0=(float)i/seg*2*(float)M_PI,a1=(float)(i+1)/seg*2*(float)M_PI;
+        triC(r,c,{c.x+cosf(a0)*rad,c.y+sinf(a0)*rad},{c.x+cosf(a1)*rad,c.y+sinf(a1)*rad},col,edge,edge);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PSYCHEDELIC FEEDBACK RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+void blitFeedback(SDL_Renderer* r,SDL_Texture* tex,float cx,float cy,
+                  float zoom,float rotation,float alpha,float hueShift,int ww,int wh){
+    float hw=ww*0.5f*zoom,hh=wh*0.5f*zoom;
+    V2 corners[4]={{-hw,-hh},{hw,-hh},{hw,hh},{-hw,hh}};
+    for(auto& c:corners){c=vrot(c,rotation);c={c.x+cx,c.y+cy};}
+    SDL_Color tint=hsv(hueShift,0.12f,1.f);
+    tint.a=(Uint8)(alpha*255);
+    SDL_SetTextureColorMod(tex,tint.r,tint.g,tint.b);
+    SDL_SetTextureAlphaMod(tex,(Uint8)(alpha*255));
+    SDL_SetTextureBlendMode(tex,SDL_BLENDMODE_ADD);
+    float uvx[4]={0,1,1,0},uvy[4]={0,0,1,1};
+    SDL_Vertex verts[4];
+    for(int i=0;i<4;++i){
+        verts[i].position={corners[i].x,corners[i].y};
+        verts[i].color=tint;
+        verts[i].tex_coord={uvx[i],uvy[i]};
+    }
+    int idx[]={0,1,2,0,2,3};
+    SDL_RenderGeometry(r,tex,verts,4,idx,6);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BAND-SPECIFIC EFFECTS (unchanged from original)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void drawSubBassMembrane(SDL_Renderer* r,float cx,float cy,float t,
+                         float sub,float bass,float maxR,int ww,int wh){
+    if(sub<0.03f&&bass<0.05f)return;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    float intensity=sub*0.7f+bass*0.3f;
+    int rings=20;
+    for(int ri=0;ri<rings;++ri){
+        float rt=(float)ri/rings;
+        float phase=fmod(rt+t*0.25f*(1.f+sub*2.f),1.f);
+        float rad=phase*maxR*1.5f;
+        float thick=25.f+sub*80.f+bass*40.f;
+        float alpha=(1.f-phase)*(1.f-phase)*intensity*85.f;
+        float hue=fmod(t*6.f+ri*18.f,360.f);
+        SDL_Color c=hsv(hue,1.f,1.f);c.a=(Uint8)std::min(alpha,255.f);
+        SDL_Color ce=c;ce.a=0;
+        int segs=40;
+        for(int i=0;i<segs;++i){
+            float a0=(float)i/segs*2*(float)M_PI;
+            float a1=(float)(i+1)/segs*2*(float)M_PI;
+            float d0=rad+sinf(a0*4+t*2.f)*sub*maxR*0.08f;
+            float d1=rad+sinf(a1*4+t*2.f)*sub*maxR*0.08f;
+            V2 p0i={cx+cosf(a0)*(d0-thick),cy+sinf(a0)*(d0-thick)};
+            V2 p0o={cx+cosf(a0)*(d0+thick),cy+sinf(a0)*(d0+thick)};
+            V2 p1i={cx+cosf(a1)*(d1-thick),cy+sinf(a1)*(d1-thick)};
+            V2 p1o={cx+cosf(a1)*(d1+thick),cy+sinf(a1)*(d1+thick)};
+            quadC(r,p0i,p0o,p1i,p1o,ce,c,ce,c);
+        }
+    }
+}
+
+static float g_lastBass=0;
+static std::vector<std::pair<float,float>> g_shocks;
+void triggerShockwave(float bass,float t){
+    if(bass>0.55f&&g_lastBass<0.55f)
+        g_shocks.push_back({0.f,fmod(t*60.f,360.f)});
+    g_lastBass=bass;
+}
+void updateShockwaves(float dt){
+    for(auto& s:g_shocks)s.first+=dt*600.f;
+    g_shocks.erase(std::remove_if(g_shocks.begin(),g_shocks.end(),
+        [](auto& s){return s.first>1200.f;}),g_shocks.end());
+}
+void drawShockwaves(SDL_Renderer* r,float cx,float cy,float bass){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    for(auto& s:g_shocks){
+        float alpha=std::max(0.f,1.f-s.first/1200.f);alpha*=alpha;
+        for(int layer=0;layer<5;++layer){
+            float lrad=s.first*(1.f+layer*0.015f);
+            float lw=5.f-layer*0.8f;
+            SDL_Color c=hsv(s.second+layer*20.f,0.7f,1.f);
+            c.a=(Uint8)(alpha*(1.f-layer*0.18f)*160);
+            int segs=80;
+            for(int i=0;i<segs;++i){
+                float a0=(float)i/segs*2*(float)M_PI;
+                float a1=(float)(i+1)/segs*2*(float)M_PI;
+                stroke(r,{cx+cosf(a0)*lrad,cy+sinf(a0)*lrad},
+                         {cx+cosf(a1)*lrad,cy+sinf(a1)*lrad},lw,c,c);
+            }
+        }
+    }
+}
+
+void drawBeatCube(SDL_Renderer* r,float cx,float cy,float t,
+                  float bass,float overall){
+    if(bass<0.08f)return;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    float size=(80.f+bass*200.f+overall*60.f);
+    float rx=t*0.4f*(1.f+bass*0.8f);
+    float ry=t*0.55f*(1.f+bass*0.6f);
+    float rz=t*0.3f*(1.f+bass*0.4f);
+    float pts[8][3]={
+        {-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+        {-1,-1, 1},{1,-1, 1},{1,1, 1},{-1,1, 1}
+    };
+    float px[8],py[8];
+    for(int i=0;i<8;++i){
+        float x=pts[i][0],y=pts[i][1],z=pts[i][2];
+        float y2=y*cosf(rx)-z*sinf(rx);float z2=y*sinf(rx)+z*cosf(rx);y=y2;z=z2;
+        float x2=x*cosf(ry)+z*sinf(ry);float z3=-x*sinf(ry)+z*cosf(ry);x=x2;z=z3;
+        float x3=x*cosf(rz)-y*sinf(rz);float y3=x*sinf(rz)+y*cosf(rz);x=x3;y=y3;
+        float fov=3.5f;
+        float scale=size*fov/(fov+z*0.5f+1.5f);
+        px[i]=cx+x*scale;py[i]=cy+y*scale;
+    }
+    int edges[12][2]={{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+    for(auto& e:edges){
+        float hue=fmod(t*55.f+e[0]*45.f,360.f);
+        SDL_Color c=hsv(hue,0.8f,1.f);c.a=(Uint8)((0.2f+bass*0.45f)*255);
+        stroke(r,{px[e[0]],py[e[0]]},{px[e[1]],py[e[1]]},1.5f+bass*3.f,c,c);
+    }
+}
+
+void drawSineWaves(SDL_Renderer* r,float cx,float cy,float t,
+                   float lowMid,float bass,float overall,int ww,int wh){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int waves=18;
+    for(int w=0;w<waves;++w){
+        float wt=(float)w/waves;
+        float yBase=(float)wh*wt;
+        float amp=(wh*0.04f)+(lowMid*wh*0.12f)+(bass*wh*0.06f*sinf(t*1.5f+w));
+        float freq=2.f+wt*4.f+lowMid*3.f;
+        float speed=t*(0.4f+wt*0.6f)*(w%2?1.f:-1.f);
+        float hue=fmod(t*15.f+w*20.f,360.f);
+        float alpha=(0.04f+lowMid*0.08f+overall*0.04f)*255;
+        SDL_Color c=hsv(hue,0.9f,1.f);c.a=(Uint8)alpha;
+        int pts=60;
+        for(int p=0;p<pts-1;++p){
+            float x0=(float)p/pts*(float)ww;
+            float x1=(float)(p+1)/pts*(float)ww;
+            float y0=yBase+sinf(x0/ww*(float)M_PI*2.f*freq+speed)*amp;
+            float y1=yBase+sinf(x1/ww*(float)M_PI*2.f*freq+speed)*amp;
+            stroke(r,{x0,y0},{x1,y1},1.2f+lowMid*2.5f,c,c);
+        }
+    }
+}
+
+void drawMegaLissajous(SDL_Renderer* r,float cx,float cy,float t,
+                       float mid,float lowMid,float overall,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    struct LParam{float fA,fB,phA,phB,scale,hueOff;};
+    LParam lp[]={
+        {3.f+mid*2.f,  2.f+mid,      t*0.4f,  t*0.3f,  0.85f, 0.f},
+        {5.f+mid*1.5f, 4.f+mid*0.8f, t*0.35f, t*0.25f, 0.7f,  120.f},
+        {2.f+mid*3.f,  3.f+mid*2.f,  t*0.5f,  t*0.4f,  0.6f,  240.f},
+        {7.f+lowMid,   6.f+lowMid,   t*0.2f,  t*0.15f, 0.45f, 60.f},
+    };
+    int pts=300;
+    for(auto& lpar:lp){
+        for(int p=0;p<pts-1;++p){
+            float t0=(float)p/pts*2*(float)M_PI;
+            float t1=(float)(p+1)/pts*2*(float)M_PI;
+            float x0=cx+sinf(lpar.fA*t0+lpar.phA)*maxR*lpar.scale;
+            float y0=cy+sinf(lpar.fB*t0+lpar.phB)*maxR*lpar.scale;
+            float x1=cx+sinf(lpar.fA*t1+lpar.phA)*maxR*lpar.scale;
+            float y1=cy+sinf(lpar.fB*t1+lpar.phB)*maxR*lpar.scale;
+            float hue=fmod(t*40.f+(float)p*1.2f+lpar.hueOff,360.f);
+            SDL_Color c=hsv(hue,0.9f,1.f);
+            c.a=(Uint8)((0.05f+mid*0.15f+overall*0.06f)*255);
+            stroke(r,{x0,y0},{x1,y1},1.f+mid*2.5f,c,c);
+        }
+    }
+}
+
+void drawFractalBurst(SDL_Renderer* r,float cx,float cy,float t,
+                      float highMid,float mid,float maxR){
+    if(highMid<0.04f)return;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    float spin=t*(0.3f+highMid*0.8f);
+    for(int gen=0;gen<3;++gen){
+        float gScale=1.f-gen*0.3f;
+        float gSpin=spin*(gen+1)*(gen%2?1.f:-1.f);
+        int arms=5+gen*3;
+        float r0=30.f*gScale, r1=maxR*0.65f*gScale*(1.f+highMid*0.4f);
+        for(int arm=0;arm<arms;++arm){
+            float baseAng=(float)arm/arms*2*(float)M_PI+gSpin;
+            for(int sub=0;sub<3;++sub){
+                float subAng=baseAng+(sub-1)*0.15f*(1.f+mid*0.3f);
+                float subR=sub==0?r1:r1*0.6f;
+                V2 p0={cx+cosf(subAng)*r0,cy+sinf(subAng)*r0};
+                V2 p1={cx+cosf(subAng)*subR,cy+sinf(subAng)*subR};
+                float hue=fmod(t*60.f+gen*120.f+arm*37.f+sub*25.f,360.f);
+                float alpha=(0.07f+highMid*0.25f+mid*0.1f)*255;
+                SDL_Color tip=hsv(hue,0.85f,1.f);tip.a=(Uint8)alpha;
+                SDL_Color root=tip;root.a=(Uint8)(alpha*0.1f);
+                stroke(r,p0,p1,1.f+highMid*3.f-gen*0.5f,root,tip);
+                if(sub==0&&arm<arms-1){
+                    float nextAng=(float)(arm+1)/arms*2*(float)M_PI+gSpin;
+                    float midAng=(baseAng+nextAng)*0.5f;
+                    float midR=r1*0.5f;
+                    V2 m0={cx+cosf(midAng)*r0*2,cy+sinf(midAng)*r0*2};
+                    V2 m1={cx+cosf(midAng)*midR,cy+sinf(midAng)*midR};
+                    SDL_Color mc=hsv(hue+30.f,0.7f,1.f);mc.a=(Uint8)(alpha*0.4f);
+                    stroke(r,m0,m1,0.8f+highMid*1.5f,mc,{mc.r,mc.g,mc.b,0});
+                }
+            }
+        }
+    }
+}
+
+struct Neuron{float x,y,vx,vy,hue,phase;};
+static std::vector<Neuron> g_neurons;
+static bool g_neuronsInit=false;
+void initNeurons(float cx,float cy,float maxR,std::mt19937& rng){
+    std::uniform_real_distribution<float> U(0,1);
+    g_neurons.resize(20);
+    for(auto& n:g_neurons){
+        float a=U(rng)*2*(float)M_PI;
+        float r=U(rng)*maxR*0.7f;
+        n.x=cx+cosf(a)*r;n.y=cy+sinf(a)*r;
+        n.vx=(U(rng)-.5f)*40.f;n.vy=(U(rng)-.5f)*40.f;
+        n.hue=U(rng)*360.f;n.phase=U(rng)*6.28f;
+    }
+    g_neuronsInit=true;
+}
+void updateNeurons(float dt,float cx,float cy,float high,float bass,float maxR,float t){
+    for(auto& n:g_neurons){
+        n.phase+=dt*(0.5f+high*2.f);
+        n.vx+=(sinf(n.phase*1.3f)*20.f-n.vx*0.1f)*dt*(1.f+high);
+        n.vy+=(cosf(n.phase*1.1f)*20.f-n.vy*0.1f)*dt*(1.f+high);
+        n.vx+=((cx-n.x)*0.02f)*dt;n.vy+=((cy-n.y)*0.02f)*dt;
+        n.vx*=0.98f;n.vy*=0.98f;
+        n.x+=n.vx*dt*(1.f+bass);n.y+=n.vy*dt*(1.f+bass);
+        n.hue=fmod(n.hue+50.f*dt,360.f);
+        float dx=n.x-cx,dy=n.y-cy;
+        if(sqrtf(dx*dx+dy*dy)>maxR*0.8f){n.vx*=-0.8f;n.vy*=-0.8f;}
+    }
+}
+void drawNeuralNet(SDL_Renderer* r,float high,float highMid,float bass){
+    if(high<0.03f&&highMid<0.04f)return;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    float connDist=200.f+high*150.f+bass*80.f;
+    for(int i=0;i<(int)g_neurons.size();++i){
+        for(int j=i+1;j<(int)g_neurons.size();++j){
+            float dx=g_neurons[i].x-g_neurons[j].x;
+            float dy=g_neurons[i].y-g_neurons[j].y;
+            float dist=sqrtf(dx*dx+dy*dy);
+            if(dist>connDist)continue;
+            float strength=1.f-dist/connDist;
+            float hue=(g_neurons[i].hue+g_neurons[j].hue)*0.5f;
+            SDL_Color c=hsv(hue,0.7f,1.f);
+            c.a=(Uint8)(strength*strength*(0.08f+high*0.22f+highMid*0.12f)*255);
+            stroke(r,{g_neurons[i].x,g_neurons[i].y},{g_neurons[j].x,g_neurons[j].y},
+                   0.8f+strength*2.5f,c,c);
+        }
+    }
+    for(auto& n:g_neurons){
+        float r2=3.f+high*8.f+bass*6.f;
+        SDL_Color c=hsv(n.hue,0.5f,1.f);c.a=(Uint8)((0.4f+high*0.6f)*255);
+        softCircle(r,{n.x,n.y},r2,c,{c.r,c.g,c.b,0},12);
+        SDL_Color wh={255,255,255,(Uint8)((0.5f+high*0.5f)*255)};
+        softCircle(r,{n.x,n.y},r2*0.3f,wh,{255,255,255,0},8);
+    }
+}
+
+void drawTunnel(SDL_Renderer* r,float cx,float cy,float t,
+                float bass,float overall,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int layers=16;
+    float globalSpin=t*0.12f*(1.f+overall*0.4f);
+    for(int li=0;li<layers;++li){
+        float phase=fmod((float)li/layers+t*0.4f*(1.f+bass*0.8f),1.f);
+        float scale=phase*maxR*1.4f;
+        float alpha=(1.f-phase)*(1.f-phase)*0.35f*(1.f+overall)*255;
+        float hue=fmod(t*22.f+li*22.5f,360.f);
+        SDL_Color c=hsv(hue,0.9f,1.f);c.a=(Uint8)std::min(alpha,255.f);
+        SDL_Color ce=c;ce.a=0;
+        SDL_Color cwedge=c;cwedge.a=(Uint8)std::min(alpha*0.04f,12.f);
+        float spin=globalSpin+li*0.2f*(li%2?1.f:-1.f);
+        int sides=3+(li%6);
+        for(int i=0;i<sides;++i){
+            float a0=(float)i/sides*2*(float)M_PI+spin;
+            float a1=(float)(i+1)/sides*2*(float)M_PI+spin;
+            float warp=scale*(1.f+overall*0.08f*sinf(a0*3+t*3.f));
+            V2 p0={cx+cosf(a0)*warp,cy+sinf(a0)*warp};
+            V2 p1={cx+cosf(a1)*warp*1.f,cy+sinf(a1)*warp};
+            stroke(r,p0,p1,2.f+overall*3.f,c,c);
+            triC(r,{cx,cy},p0,p1,ce,cwedge,cwedge);
+        }
+    }
+}
+
+void drawRibbonTornado(SDL_Renderer* r,float cx,float cy,float t,
+                       float bass,float mid,float overall,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int ribbons=8;
+    int pts=80;
+    for(int ri=0;ri<ribbons;++ri){
+        float rPhase=(float)ri/ribbons*2*(float)M_PI;
+        float spinRate=0.5f+ri*0.12f;
+        float hueBase=fmod(t*35.f+ri*45.f,360.f);
+        V2 prev={0,0}; bool hasPrev=false;
+        for(int p=0;p<pts;++p){
+            float tf=(float)p/pts;
+            float angle=rPhase+tf*4*(float)M_PI+t*spinRate*(ri%2?1.f:-1.f);
+            float rad=tf*maxR*0.85f
+                     +mid*maxR*0.15f*sinf(tf*8+t*1.5f+ri);
+            float zOff=sinf(tf*3*(float)M_PI+t*0.8f+rPhase)*0.4f;
+            float perspScale=1.f/(1.5f-zOff*0.4f);
+            V2 cur={cx+cosf(angle)*rad*perspScale,
+                    cy+sinf(angle)*rad*perspScale*0.6f+zOff*80.f};
+            if(hasPrev){
+                float hue=fmod(hueBase+tf*90.f,360.f);
+                float alpha=(0.12f+overall*0.2f+bass*0.15f)*(1.f-tf*0.4f)*255;
+                SDL_Color c=hsv(hue,0.85f,1.f);c.a=(Uint8)std::min(alpha,255.f);
+                SDL_Color ce=c;ce.a=(Uint8)(c.a/5);
+                float lw=(3.f+mid*6.f+bass*5.f)*(1.f-tf*0.5f);
+                stroke(r,prev,cur,lw,ce,c);
+            }
+            prev=cur;hasPrev=true;
+        }
+    }
+}
+
+void drawAurora(SDL_Renderer* r,float cx,float cy,float t,
+                float mid,float lowMid,float overall,int ww,int wh){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int curtains=12;
+    for(int ci=0;ci<curtains;++ci){
+        float ct=(float)ci/curtains;
+        float xBase=ct*(float)ww;
+        float sway=sinf(t*0.3f+ci*0.7f)*ww*0.06f
+                  +cosf(t*0.5f+ci*0.4f)*ww*0.03f*mid;
+        float width=20.f+lowMid*60.f+mid*40.f+sinf(t*0.8f+ci)*20.f;
+        float hue=fmod(t*12.f+ci*30.f,360.f);
+        int strips=6;
+        for(int si=0;si<strips;++si){
+            float st=(float)si/strips;
+            float x=xBase+sway+st*width;
+            float alpha=(sinf(st*(float)M_PI))*(0.04f+mid*0.1f+lowMid*0.08f)*255;
+            SDL_Color top=hsv(hue+si*8.f,0.75f,1.f);top.a=(Uint8)std::min(alpha,255.f);
+            SDL_Color bot=top;bot.a=0;
+            int segs=12;
+            for(int seg=0;seg<segs;++seg){
+                float y0=(float)seg/segs*(float)wh;
+                float y1=(float)(seg+1)/segs*(float)wh;
+                float wave0=sinf(y0/wh*4*(float)M_PI+t*0.6f+ci)*sway*0.3f;
+                float wave1=sinf(y1/wh*4*(float)M_PI+t*0.6f+ci)*sway*0.3f;
+                float aFrac=sinf((float)seg/segs*(float)M_PI);
+                SDL_Color sc=top;sc.a=(Uint8)(top.a*aFrac);
+                quadC(r,{x+wave0,y0},{x+wave0+width*0.15f,y0},
+                         {x+wave1,y1},{x+wave1+width*0.15f,y1},
+                         bot,sc,bot,sc);
+            }
+        }
+    }
+}
+
+void drawHypnoSpiral(SDL_Renderer* r,float cx,float cy,float t,
+                     float mid,float bass,float overall,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int arms=4;
+    int pts=400;
+    float spinRate=t*0.25f*(1.f+overall*0.5f);
+    for(int arm=0;arm<arms;++arm){
+        float armOff=(float)arm/arms*2*(float)M_PI;
+        for(int p=0;p<pts-1;++p){
+            float tf0=(float)p/pts,tf1=(float)(p+1)/pts;
+            float theta0=tf0*6*(float)M_PI+spinRate+armOff;
+            float theta1=tf1*6*(float)M_PI+spinRate+armOff;
+            float srad0=tf0*maxR*0.9f;
+            float srad1=tf1*maxR*0.9f;
+            V2 p0={cx+cosf(theta0)*srad0,cy+sinf(theta0)*srad0};
+            V2 p1={cx+cosf(theta1)*srad1,cy+sinf(theta1)*srad1};
+            float hue=fmod(t*20.f+tf0*120.f+arm*90.f,360.f);
+            float alpha=(0.05f+mid*0.12f+overall*0.06f)*(1.f-tf0*0.5f)*255;
+            SDL_Color c=hsv(hue,0.9f,1.f);c.a=(Uint8)std::min(alpha,255.f);
+            stroke(r,p0,p1,1.f+mid*2.5f+bass*2.f,c,c);
+        }
+    }
+}
+
+void drawWormhole(SDL_Renderer* r,float cx,float cy,float t,
+                  float bass,float mid,float overall,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int rings=20;
+    float tilt=sinf(t*0.2f)*(float)M_PI*0.35f+mid*0.3f;
+    float tiltY=cosf(t*0.15f)*(float)M_PI*0.2f;
+    float warpSpin=t*0.3f;
+    for(int ri=0;ri<rings;++ri){
+        float phase=fmod((float)ri/rings+t*0.5f*(1.f+bass*0.6f),1.f);
+        float rad=phase*maxR*1.2f;
+        float squash=0.45f+mid*0.2f+cosf(tilt)*0.35f;
+        float alpha=(1.f-phase)*(1.f-phase)*(0.1f+overall*0.15f)*255;
+        float hue=fmod(t*18.f+ri*18.f,360.f);
+        SDL_Color c=hsv(hue,0.85f,1.f);c.a=(Uint8)std::min(alpha,255.f);
+        int segs=48;
+        float spinOff=warpSpin+ri*0.1f*(ri%2?1.f:-1.f);
+        for(int i=0;i<segs;++i){
+            float a0=(float)i/segs*2*(float)M_PI+spinOff;
+            float a1=(float)(i+1)/segs*2*(float)M_PI+spinOff;
+            float x0=cosf(a0)*rad,z0=sinf(a0)*rad;
+            float x1=cosf(a1)*rad,z1=sinf(a1)*rad;
+            float px0=cx+x0*cosf(tilt)-z0*sinf(tilt)*squash;
+            float py0=cy+x0*sinf(tiltY)+z0*cosf(tilt)*squash;
+            float px1=cx+x1*cosf(tilt)-z1*sinf(tilt)*squash;
+            float py1=cy+x1*sinf(tiltY)+z1*cosf(tilt)*squash;
+            stroke(r,{px0,py0},{px1,py1},1.5f+overall*2.f,c,c);
+        }
+    }
+}
+
+struct RainDrop{float x,y,speed,hue,brightness;int col;};
+static std::vector<RainDrop> g_rain;
+static bool g_rainInit=false;
+void initRain(int ww,int wh,std::mt19937& rng){
+    std::uniform_real_distribution<float> U(0,1);
+    int cols=ww/14;g_rain.resize(cols);
+    for(int i=0;i<cols;++i){
+        g_rain[i]={14.f*i+(float)(rand()%14),U(rng)*(float)wh,
+                   40.f+U(rng)*120.f,fmod(U(rng)*360.f,360.f),U(rng),i};
+    }
+    g_rainInit=true;
+}
+void updateRain(float dt,float high,float overall,int wh){
+    for(auto& d:g_rain){
+        d.y+=d.speed*(1.f+high*3.f+overall)*dt;
+        if(d.y>(float)wh+20.f)d.y=-20.f;
+        d.hue=fmod(d.hue+30.f*dt,360.f);
+    }
+}
+void drawRain(SDL_Renderer* r,float high,float overall,int wh){
+    if(high<0.03f&&overall<0.05f)return;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    float baseAlpha=(0.03f+high*0.1f+overall*0.04f);
+    for(auto& d:g_rain){
+        int trailLen=8;
+        for(int tr=0;tr<trailLen;++tr){
+            float ty=d.y-(float)tr*14.f;
+            float tf=1.f-(float)tr/trailLen;
+            float a=tf*tf*baseAlpha*255;
+            SDL_Color c=hsv(d.hue,0.7f,1.f);c.a=(Uint8)std::min(a,255.f);
+            SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
+            SDL_FRect dot={d.x,ty,5,8};
+            SDL_RenderFillRectF(r,&dot);
+        }
+    }
+}
+
+void drawGalaxy(SDL_Renderer* r,float cx,float cy,float t,
+                float bass,float mid,float high,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int arms=4,pts=150;
+    float spinRate=t*0.08f;
+    for(int arm=0;arm<arms;++arm){
+        float armBase=(float)arm/arms*2*(float)M_PI;
+        for(int p=0;p<pts-1;++p){
+            float tf0=(float)p/pts,tf1=(float)(p+1)/pts;
+            float theta0=tf0*5*(float)M_PI+armBase+spinRate;
+            float theta1=tf1*5*(float)M_PI+armBase+spinRate;
+            float grad0=expf(tf0*1.8f)*(12.f+bass*8.f);
+            float grad1=expf(tf1*1.8f)*(12.f+bass*8.f);
+            if(grad0>maxR*0.9f||grad1>maxR*0.9f)break;
+            float scatter=sinf(tf0*20+t*3+arm)*15.f*mid;
+            float perpAng=theta0+(float)M_PI_2;
+            V2 p0={cx+cosf(theta0)*grad0+cosf(perpAng)*scatter,
+                   cy+sinf(theta0)*grad0+sinf(perpAng)*scatter};
+            V2 p1={cx+cosf(theta1)*grad1,cy+sinf(theta1)*grad1};
+            float hue=fmod(t*25.f+arm*90.f+tf0*60.f,360.f);
+            float alpha=(0.06f+high*0.12f+mid*0.08f)*(1.f-tf0*0.3f)*255;
+            SDL_Color c=hsv(hue,0.8f,1.f);c.a=(Uint8)std::min(alpha,255.f);
+            float lw=1.f+high*2.f+(1.f-tf0)*bass*3.f;
+            stroke(r,p0,p1,lw,c,c);
+        }
+    }
+}
+
+void drawSpectrumRing(SDL_Renderer* r,float cx,float cy,float t,
+                      float bass,float mid,float high,float overall,
+                      const std::vector<float>& spec,float maxR){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    int bars=256;
+    float innerR=60.f+bass*25.f;
+    for(int b=0;b<bars;++b){
+        float bt=(float)b/bars;
+        float ang=bt*2*(float)M_PI - (float)M_PI_2 + t*0.08f*(1.f+overall*0.3f);
+        int fi=std::clamp((int)(bt*FREQ_BINS*0.55f),0,FREQ_BINS-1);
+        float val=spec[fi];
+        float r0=innerR;
+        float r1=innerR+val*(160.f+bass*140.f+mid*60.f);
+        V2 lp0={cx+cosf(ang)*r0,cy+sinf(ang)*r0};
+        V2 lp1={cx+cosf(ang)*r1,cy+sinf(ang)*r1};
+        float hue=fmod(t*35.f+bt*360.f,360.f);
+        SDL_Color tip =hsv(hue,0.9f,1.f); tip.a =(Uint8)((0.18f+val*0.65f)*255);
+        SDL_Color root=hsv(hue+40,0.6f,0.5f); root.a=(Uint8)(tip.a/8);
+        stroke(r,lp0,lp1,1.2f+val*3.5f,root,tip);
+    }
+    for(int b=0;b<bars;++b){
+        float bt=(float)b/bars;
+        float ang=bt*2*(float)M_PI - (float)M_PI_2 + t*0.08f*(1.f+overall*0.3f);
+        int fi=std::clamp((int)(bt*FREQ_BINS*0.55f),0,FREQ_BINS-1);
+        float val=spec[fi]*0.6f;
+        float r0=innerR;
+        float r1=innerR-val*(50.f+bass*40.f);
+        r1=std::max(r1,5.f);
+        V2 lp0={cx+cosf(ang)*r0,cy+sinf(ang)*r0};
+        V2 lp1={cx+cosf(ang)*r1,cy+sinf(ang)*r1};
+        float hue=fmod(t*35.f+bt*360.f+180.f,360.f);
+        SDL_Color c=hsv(hue,0.85f,1.f); c.a=(Uint8)((0.1f+val*0.4f)*255);
+        stroke(r,lp0,lp1,0.8f+val*2.f,c,c);
+    }
+    int segs=128;
+    for(int i=0;i<segs;++i){
+        float a0=(float)i/segs*2*(float)M_PI+t*0.08f;
+        float a1=(float)(i+1)/segs*2*(float)M_PI+t*0.08f;
+        float hue=fmod(t*20.f+(float)i/segs*360.f,360.f);
+        SDL_Color c=hsv(hue,0.8f,1.f); c.a=(Uint8)((0.15f+overall*0.2f)*255);
+        stroke(r,{cx+cosf(a0)*innerR,cy+sinf(a0)*innerR},
+                 {cx+cosf(a1)*innerR,cy+sinf(a1)*innerR},1.f+overall*1.5f,c,c);
+    }
+}
+
+struct GeoShape{float x,y,angle,spinSpd,size,hue,orbitR,orbitAng,orbitSpd;int sides;};
+static std::vector<GeoShape> g_geo;
+static bool g_geoInit=false;
+void initGeo(float cx,float cy,float maxR,std::mt19937& rng){
+    std::uniform_real_distribution<float> U(0,1);
+    g_geo.resize(40);
+    for(int i=0;i<40;++i){
+        auto& g=g_geo[i];
+        g.orbitR  =maxR*(0.05f+U(rng)*0.88f);
+        g.orbitAng=U(rng)*2*(float)M_PI;
+        g.orbitSpd=(0.1f+U(rng)*0.5f)*(i%2?1.f:-1.f);
+        g.angle   =U(rng)*6.28f;
+        g.spinSpd =(0.3f+U(rng)*1.5f)*(i%3==0?1.f:-1.f);
+        g.size    =8.f+U(rng)*28.f;
+        g.hue     =U(rng)*360.f;
+        g.sides   =3+i%6;
+        g.x=cx+cosf(g.orbitAng)*g.orbitR;
+        g.y=cy+sinf(g.orbitAng)*g.orbitR;
+    }
+    g_geoInit=true;
+}
+void updateGeo(float dt,float cx,float cy,float bass,float overall){
+    for(auto& g:g_geo){
+        g.orbitAng+=dt*g.orbitSpd*(1.f+overall*0.5f);
+        g.angle   +=dt*g.spinSpd;
+        g.hue=fmod(g.hue+25.f*dt,360.f);
+        g.x=cx+cosf(g.orbitAng)*g.orbitR;
+        g.y=cy+sinf(g.orbitAng)*g.orbitR;
+    }
+}
+void drawGeoShapes(SDL_Renderer* r,float bass,float mid,float overall){
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    for(auto& g:g_geo){
+        float sz=g.size*(1.f+bass*0.4f+mid*0.2f);
+        float alpha=(0.1f+overall*0.2f+mid*0.15f)*255;
+        SDL_Color edge=hsv(g.hue,0.85f,1.f); edge.a=(Uint8)std::min(alpha,255.f);
+        SDL_Color fill=edge; fill.a=(Uint8)(edge.a*0.08f);
+        for(int p=0;p<g.sides;++p){
+            float a0=(float)p/g.sides*2*(float)M_PI+g.angle;
+            float a1=(float)(p+1)/g.sides*2*(float)M_PI+g.angle;
+            V2 p0={g.x+cosf(a0)*sz,g.y+sinf(a0)*sz};
+            V2 p1={g.x+cosf(a1)*sz,g.y+sinf(a1)*sz};
+            triC(r,{g.x,g.y},p0,p1,fill,edge,edge);
+            stroke(r,p0,p1,0.8f+mid*1.5f,edge,edge);
+        }
+        float innerSz=sz*0.45f;
+        float innerRot=g.angle+(float)M_PI/g.sides;
+        SDL_Color inner=hsv(fmod(g.hue+60,360.f),0.8f,1.f);
+        inner.a=(Uint8)(edge.a*0.6f);
+        for(int p=0;p<g.sides;++p){
+            float a0=(float)p/g.sides*2*(float)M_PI+innerRot;
+            float a1=(float)(p+1)/g.sides*2*(float)M_PI+innerRot;
+            V2 p0={g.x+cosf(a0)*innerSz,g.y+sinf(a0)*innerSz};
+            V2 p1={g.x+cosf(a1)*innerSz,g.y+sinf(a1)*innerSz};
+            stroke(r,p0,p1,0.6f+overall,inner,inner);
+        }
+    }
+}
+
+// KALEIDOSCOPE CORE
+static constexpr int KNODES=12;
+struct KNode{
+    V2    pos;
+    float hue,hueSpd;
+    float orbitRadius;
+    float orbitAngle;
+    float orbitSpeed;
+    float orbitEcc;
+    float wobbleAmp;
+    float wobbleFreq;
+    float wobblePhase;
+    int   trailLen;
+    std::deque<V2> trail;
+};
+static KNode g_kn[KNODES];
+void initKNodes(float maxR,std::mt19937& rng){
+    std::uniform_real_distribution<float> U(0,1);
+    for(int i=0;i<KNODES;++i){
+        auto& n=g_kn[i];
+        float it=(float)i/KNODES;
+        n.orbitRadius  = maxR*(0.08f+it*0.72f);
+        n.orbitAngle   = U(rng)*2*(float)M_PI;
+        n.orbitSpeed   = (0.25f+U(rng)*0.6f)*(i%2?1.f:-1.f);
+        n.orbitEcc     = 0.05f+U(rng)*0.25f;
+        n.wobbleAmp    = maxR*(0.02f+U(rng)*0.06f);
+        n.wobbleFreq   = 2.f+U(rng)*4.f;
+        n.wobblePhase  = U(rng)*6.28f;
+        n.hue          = U(rng)*360.f;
+        n.hueSpd       = 20.f+U(rng)*60.f;
+        n.trailLen     = 80+(int)(U(rng)*60.f);
+        float r=n.orbitRadius*(1.f+n.orbitEcc*cosf(n.orbitAngle));
+        float a=n.orbitAngle/SANG;
+        n.pos={r, clamp01(fmod(a,1.f))};
+    }
+}
+void updateKNodes(float dt,float bass,float mid,float overall,float maxR){
+    for(auto& n:g_kn){
+        n.orbitAngle+=dt*n.orbitSpeed*(1.f+overall*0.6f);
+        n.wobblePhase+=dt*n.wobbleFreq;
+        n.hue=fmod(n.hue+n.hueSpd*dt,360.f);
+        float r=n.orbitRadius*(1.f+n.orbitEcc*cosf(n.orbitAngle))
+               +n.wobbleAmp*sinf(n.wobblePhase)*(1.f+mid*0.5f);
+        r=std::max(r,5.f);
+        float sliceAngle=fmod(n.orbitAngle/(2*(float)M_PI),1.f);
+        if(sliceAngle<0)sliceAngle+=1.f;
+        n.pos={r,sliceAngle};
+        n.trail.push_front(n.pos);
+        if((int)n.trail.size()>n.trailLen)n.trail.pop_back();
+    }
+}
+V2 s2c(V2 p){float a=p.y*SANG;return{cosf(a)*p.x,sinf(a)*p.x};}
+
+void drawKaleidoscope(SDL_Renderer* ren,float cx,float cy,
+                      float bass,float mid,float high,float overall,
+                      float t,const std::vector<float>& spec,float maxR){
+    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+    float gspin=t*0.07f*(1.f+overall*0.3f);
+    for(int s=0;s<KSLICES;++s){
+        float base=s*SANG+gspin;bool mir=(s%2==1);
+        V2 orig={cx,cy};
+        auto W=[&](V2 p)->V2{if(mir)p={p.x,-p.y};return vrot(p,base)+orig;};
+        for(int b=0;b<50;++b){
+            float bt=(float)b/50,ang=bt*SANG;
+            int fi=std::clamp((int)(bt*FREQ_BINS*.5f),0,FREQ_BINS-1);
+            float val=spec[fi];
+            float r0=28.f+bass*18.f,r1=r0+val*(220.f+bass*200.f+mid*90.f);
+            V2 lp0={cosf(ang)*r0,sinf(ang)*r0},lp1={cosf(ang)*r1,sinf(ang)*r1};
+            SDL_Color tip=hsv(fmod(t*38.f+bt*200.f+s*5.f,360.f),.9f,1.f);
+            tip.a=(Uint8)((0.15f+val*.55f)*255);
+            SDL_Color root=hsv(fmod(t*38.f+bt*200.f+s*5.f+50,360.f),.7f,.5f);
+            root.a=(Uint8)(tip.a/6);
+            stroke(ren,W(lp0),W(lp1),1.5f+val*4.f,root,tip);
+        }
+        for(int ni=0;ni<KNODES;++ni){
+            auto& n=g_kn[ni];int tlen=(int)n.trail.size();if(tlen<2)continue;
+            for(int tr=0;tr<tlen-1;++tr){
+                float tf=1.f-(float)tr/tlen,tf2=tf*tf;
+                SDL_Color c=hsv(fmod(n.hue+tr*2.5f,360.f),.85f,1.f);
+                c.a=(Uint8)(tf2*(0.2f+overall*.3f)*255);
+                stroke(ren,W(s2c(n.trail[tr])),W(s2c(n.trail[tr+1])),
+                       (1.5f+overall*3.5f+bass*3.f)*tf,c,c);
+            }
+            V2 head=W(s2c(n.trail[0]));float dr=2.5f+overall*5.f+bass*5.f;
+            SDL_Color dc=hsv(n.hue,.4f,1.f);dc.a=(Uint8)(190+overall*65);
+            softCircle(ren,head,dr,dc,{dc.r,dc.g,dc.b,0},10);
+        }
+        for(int petal=0;petal<3;++petal){
+            float pf=(float)petal/3,pr=55.f+pf*maxR*.42f;
+            float spin=t*(0.6f+pf*.5f)*(petal%2?1:-1)*(1.f+overall*.5f);
+            V2 center={cosf(pf*SANG)*pr,sinf(pf*SANG)*pr};
+            float petalR=20.f+mid*30.f+bass*25.f;
+            for(int pt=0;pt<6;++pt){
+                float a0=(float)pt/6*2*(float)M_PI+spin,a1=(float)(pt+1)/6*2*(float)M_PI+spin;
+                V2 lp0=center+V2{cosf(a0)*petalR,sinf(a0)*petalR};
+                V2 lp1=center+V2{cosf(a1)*petalR,sinf(a1)*petalR};
+                float hue=fmod(t*50.f+petal*120.f+pt*60.f,360.f);
+                SDL_Color edge=hsv(hue,.9f,1.f);edge.a=(Uint8)((0.2f+mid*.45f+overall*.2f)*255);
+                SDL_Color fill=edge;fill.a=fill.a/5;
+                triC(ren,W(center),W(lp0),W(lp1),fill,edge,edge);
+                stroke(ren,W(lp0),W(lp1),1.f+mid*2.f,edge,edge);
+            }
+        }
+        for(int ri=0;ri<8;++ri){
+            float rt=(float)ri/8;
+            float rr=35.f+rt*maxR*.78f+high*18.f*cosf(t*3.f+ri);
+            SDL_Color c=hsv(fmod(t*28.f+ri*25.7f,360.f),.85f,1.f);
+            c.a=(Uint8)((0.03f+overall*.07f)*255);
+            for(int sg=0;sg<16;++sg){
+                float a0=(float)sg/16*SANG,a1=(float)(sg+1)/16*SANG;
+                if(mir){a0=SANG-a0;a1=SANG-a1;}
+                stroke(ren,W({cosf(a0)*rr,sinf(a0)*rr}),W({cosf(a1)*rr,sinf(a1)*rr}),1.f+overall*2.f,c,c);
+            }
+        }
+    }
+    float orbR=16.f+overall*35.f+bass*50.f;
+    for(int layer=5;layer>=0;--layer){
+        float lt=(float)layer/5.f;
+        SDL_Color c=hsv(fmod(t*65.f+layer*42.f,360.f),.85f,1.f);
+        c.a=(Uint8)((0.03f+overall*.1f)*(1.f-lt)*255);
+        softCircle(ren,{cx,cy},orbR*(4.f-lt*3.f),c,{c.r,c.g,c.b,0},32);
+    }
+    for(int ri=0;ri<3;++ri){
+        float rr=orbR*(.55f+ri*.32f),ang=t*(1.f+ri*.55f)*(ri%2?1.f:-1.f);
+        SDL_Color c=hsv(fmod(t*75.f+ri*90.f,360.f),.9f,1.f);c.a=(Uint8)((0.3f+overall*.25f)*255);
+        for(int sg=0;sg<48;++sg){
+            float a0=(float)sg/48*2*(float)M_PI+ang,a1=(float)(sg+1)/48*2*(float)M_PI+ang;
+            stroke(ren,{cx+cosf(a0)*rr,cy+sinf(a0)*rr},
+                       {cx+cosf(a1)*rr,cy+sinf(a1)*rr},1.5f+overall*1.5f,c,c);
+        }
+    }
+    SDL_Color wh={255,255,255,(Uint8)(std::min(1.f,.9f+bass*.1f)*255)};
+    softCircle(ren,{cx,cy},orbR*.35f,wh,{255,255,255,0},32);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIBRARY & PLAYLIST SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+namespace fs = std::filesystem;
+
+struct Song {
+    std::string path;
+    std::string title;
+};
+struct Playlist {
+    std::string name;
+    std::vector<int> songIndices;
+};
+
+static std::vector<Song>     g_library;
+static std::vector<Playlist> g_playlists;
+static int                   g_currentSong    = -1;
+static int                   g_currentPL      = -1;
+static int                   g_currentPLTrack = -1;
+
+static std::string getConfigPath() {
+    char buf[MAX_PATH];
+    GetModuleFileNameA(nullptr,buf,MAX_PATH);
+    std::string exe(buf);
+    auto slash=exe.find_last_of("\\/");
+    return exe.substr(0,slash+1)+"library.dat";
+}
+
+std::string baseName(const std::string& p){
+    auto s=p.find_last_of("\\/");
+    std::string fn=(s==std::string::npos)?p:p.substr(s+1);
+    auto dot=fn.rfind('.');
+    return dot==std::string::npos?fn:fn.substr(0,dot);
+}
+
+void saveLibrary(){
+    std::ofstream f(getConfigPath());
+    if(!f)return;
+    f<<"SONGS "<<g_library.size()<<"\n";
+    for(auto& s:g_library) f<<s.path<<"\n";
+    f<<"PLAYLISTS "<<g_playlists.size()<<"\n";
+    for(auto& pl:g_playlists){
+        f<<"PL "<<pl.name<<"\n";
+        f<<"COUNT "<<pl.songIndices.size()<<"\n";
+        for(int i:pl.songIndices) f<<i<<"\n";
+    }
+}
+
+void loadLibrary(){
+    g_library.clear();g_playlists.clear();
+    std::ifstream f(getConfigPath());
+    if(!f)return;
+    std::string line;
+    int nSongs=0;
+    std::getline(f,line);
+    if(line.substr(0,5)=="SONGS") nSongs=std::stoi(line.substr(6));
+    for(int i=0;i<nSongs;++i){
+        std::getline(f,line);
+        if(!line.empty()&&fs::exists(line))
+            g_library.push_back({line,baseName(line)});
+    }
+    int nPL=0;
+    if(std::getline(f,line)&&line.substr(0,9)=="PLAYLISTS")
+        nPL=std::stoi(line.substr(10));
+    for(int p=0;p<nPL;++p){
+        Playlist pl;
+        if(std::getline(f,line)&&line.substr(0,2)=="PL") pl.name=line.substr(3);
+        int cnt=0;
+        if(std::getline(f,line)&&line.substr(0,5)=="COUNT") cnt=std::stoi(line.substr(6));
+        for(int i=0;i<cnt;++i){
+            std::getline(f,line);
+            int idx=std::stoi(line);
+            if(idx>=0&&idx<(int)g_library.size()) pl.songIndices.push_back(idx);
+        }
+        g_playlists.push_back(pl);
+    }
+}
+
+void addToLibrary(const std::string& path){
+    for(auto& s:g_library) if(s.path==path) return;
+    g_library.push_back({path,baseName(path)});
+    saveLibrary();
+}
+
+void playLibrarySong(int idx){
+    if(idx<0||idx>=(int)g_library.size())return;
+    g_currentSong=idx;
+    loadAndPlay(g_library[idx].path);
+}
+
+void playNext(){
+    if(g_currentPL>=0&&g_currentPL<(int)g_playlists.size()){
+        auto& pl=g_playlists[g_currentPL];
+        if(pl.songIndices.empty())return;
+        g_currentPLTrack=(g_currentPLTrack+1)%(int)pl.songIndices.size();
+        playLibrarySong(pl.songIndices[g_currentPLTrack]);
+    } else if(!g_library.empty()){
+        g_currentSong=(g_currentSong+1)%(int)g_library.size();
+        playLibrarySong(g_currentSong);
+    }
+}
+void playPrev(){
+    if(g_currentPL>=0&&g_currentPL<(int)g_playlists.size()){
+        auto& pl=g_playlists[g_currentPL];
+        if(pl.songIndices.empty())return;
+        g_currentPLTrack=((g_currentPLTrack-1)+(int)pl.songIndices.size())%(int)pl.songIndices.size();
+        playLibrarySong(pl.songIndices[g_currentPLTrack]);
+    } else if(!g_library.empty()){
+        g_currentSong=((g_currentSong-1)+(int)g_library.size())%(int)g_library.size();
+        playLibrarySong(g_currentSong);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RADIAL MENU SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Menu button lives at top-center, updated each frame to ww/2
+static float          MENU_BTN_X  = 640.f;
+static constexpr float MENU_BTN_Y  = 36.f;
+static constexpr float MENU_BTN_R  = 22.f;
+static constexpr float MENU_ITEM_R = 22.f;
+static constexpr float MENU_DIST   = 180.f;
+// Arc fans downward symmetrically centered on 90deg (straight down in SDL coords)
+// 20deg = down-right, 160deg = down-left, passing through 90deg = straight down
+static constexpr float MENU_ARC_START = 20.f * (float)M_PI / 180.f;
+static constexpr float MENU_ARC_END   = 160.f * (float)M_PI / 180.f;
+
+enum class MenuAction { None, Library, Playlists, AddSong, PlayPause, Prev, Next, NewPlaylist, Spotify };
+static constexpr int MENU_ITEM_COUNT = 8;
+
+struct MenuItem {
+    MenuAction  action;
+    const char* label;
+    const char* icon;
+    float       hue;
+};
+
+static const MenuItem MENU_ITEMS[MENU_ITEM_COUNT] = {
+    { MenuAction::Prev,        "Prev",      "<<",  200.f },
+    { MenuAction::PlayPause,   "Play/Pause","||>", 120.f },
+    { MenuAction::Next,        "Next",      ">>",  200.f },
+    { MenuAction::AddSong,     "Add Song",  "+",    80.f },
+    { MenuAction::Library,     "Library",   "LIB", 180.f },
+    { MenuAction::Playlists,   "Playlists", "PLS", 280.f },
+    { MenuAction::NewPlaylist, "New List",  "+PL", 320.f },
+    { MenuAction::Spotify,     "Spotify",   "SPT", 135.f },
+};
+
+// Menu state
+static float g_menuOpen      = 0.f;  // 0=closed, 1=open (animated)
+static bool  g_menuTarget    = false; // true = open, false = closed
+static float g_menuBtnPulse  = 0.f;  // time-driven pulse on the button
+static int   g_menuHover     = -1;   // which item is hovered (-1 = none)
+// Per-item stagger: each item has its own animation progress
+static float g_itemAnim[MENU_ITEM_COUNT] = {};
+// Ripple rings emitted on open/close
+struct MenuRipple { float r, alpha, hue; };
+static std::vector<MenuRipple> g_menuRipples;
+
+// Compute world position of menu item i given current open progress
+V2 menuItemPos(int i, float openProg) {
+    float t = (float)i / (MENU_ITEM_COUNT - 1);
+    float ang = MENU_ARC_START + t * (MENU_ARC_END - MENU_ARC_START);
+    // Spring the distance out
+    float dist = MENU_DIST * openProg;
+    return { MENU_BTN_X + cosf(ang) * dist,
+             MENU_BTN_Y + sinf(ang) * dist };
+}
+
+// Draw a glowing circle button (used for both trigger and items)
+void drawGlowCircle(SDL_Renderer* r, V2 pos, float radius,
+                    SDL_Color col, float glowStrength, float alpha,
+                    const std::string& label, bool centered=true) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    // Outer glow layers
+    int glowLayers = 5;
+    for(int g=glowLayers;g>=0;--g){
+        float gf = (float)g/glowLayers;
+        float gr = radius * (1.f + gf * 1.6f * glowStrength);
+        SDL_Color gc = col;
+        gc.a = (Uint8)(alpha * (1.f - gf) * (1.f - gf) * glowStrength * 0.6f * 255.f);
+        softCircle(r, pos, gr, gc, {gc.r, gc.g, gc.b, 0}, 20);
+    }
+    // Main body — slightly filled
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_Color body = col;
+    body.a = (Uint8)(alpha * 0.18f * 255.f);
+    softCircle(r, pos, radius, body, {body.r, body.g, body.b, 0}, 24);
+    // Crisp ring
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    SDL_Color ring = col;
+    ring.a = (Uint8)(alpha * 255.f);
+    int segs = 32;
+    for(int i=0;i<segs;++i){
+        float a0=(float)i/segs*2*(float)M_PI;
+        float a1=(float)(i+1)/segs*2*(float)M_PI;
+        stroke(r,
+            {pos.x+cosf(a0)*radius, pos.y+sinf(a0)*radius},
+            {pos.x+cosf(a1)*radius, pos.y+sinf(a1)*radius},
+            1.5f, ring, ring);
+    }
+    // Label
+    if(!label.empty() && g_fontSm) {
+        SDL_Color tc = col;
+        tc.a = (Uint8)(alpha * 255.f);
+        drawText(r, g_fontSm, label,
+                 (int)pos.x, (int)(pos.y - 6),
+                 tc, centered);
+    }
+}
+
+// Draw three horizontal lines (hamburger) or an X, animating between them
+void drawHamburgerIcon(SDL_Renderer* r, V2 pos, float openProg, float alpha, float hue) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    SDL_Color c = hsv(hue, 0.6f, 1.f);
+    c.a = (Uint8)(alpha * 255.f);
+
+    float sz = 10.f;
+    float rot = openProg * (float)M_PI * 0.75f; // rotate toward X
+
+    // Line 1 — top bar / diagonal
+    float off1Y = -5.f * (1.f - openProg); // collapse toward center
+    V2 a1 = vrot({-sz, off1Y}, rot) + pos;
+    V2 b1 = vrot({ sz, off1Y}, rot) + pos;
+    stroke(r, a1, b1, 1.8f, c, c);
+
+    // Line 2 — middle bar / fades out
+    SDL_Color c2 = c; c2.a = (Uint8)(c.a * (1.f - openProg));
+    V2 a2 = vrot({-sz, 0.f}, 0.f) + pos;
+    V2 b2 = vrot({ sz, 0.f}, 0.f) + pos;
+    stroke(r, a2, b2, 1.8f, c2, c2);
+
+    // Line 3 — bottom bar / opposite diagonal
+    float off3Y = 5.f * (1.f - openProg);
+    V2 a3 = vrot({-sz, off3Y}, -rot) + pos;
+    V2 b3 = vrot({ sz, off3Y}, -rot) + pos;
+    stroke(r, a3, b3, 1.8f, c, c);
+}
+
+void updateMenuRipples(float dt) {
+    for(auto& rp : g_menuRipples){
+        rp.r += dt * 180.f;
+        rp.alpha -= dt * 2.2f;
+    }
+    g_menuRipples.erase(
+        std::remove_if(g_menuRipples.begin(), g_menuRipples.end(),
+            [](const MenuRipple& rp){ return rp.alpha <= 0.f; }),
+        g_menuRipples.end());
+}
+
+void drawMenuRipples(SDL_Renderer* r) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    V2 orig = {MENU_BTN_X, MENU_BTN_Y};
+    for(auto& rp : g_menuRipples){
+        int segs = 32;
+        SDL_Color c = hsv(rp.hue, 0.7f, 1.f);
+        c.a = (Uint8)(std::clamp(rp.alpha, 0.f, 1.f) * 180.f);
+        for(int i=0;i<segs;++i){
+            float a0=(float)i/segs*2*(float)M_PI;
+            float a1=(float)(i+1)/segs*2*(float)M_PI;
+            stroke(r,
+                {orig.x+cosf(a0)*rp.r, orig.y+sinf(a0)*rp.r},
+                {orig.x+cosf(a1)*rp.r, orig.y+sinf(a1)*rp.r},
+                1.5f, c, c);
+        }
+    }
+}
+
+// Draw arc "connector" lines from the trigger to each item so it looks like
+// a proper fan structure
+void drawMenuArcs(SDL_Renderer* r, float openProg, float t) {
+    if(openProg < 0.01f) return;
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    V2 orig = {MENU_BTN_X, MENU_BTN_Y};
+    for(int i = 0; i < MENU_ITEM_COUNT; ++i){
+        float ip = clamp01(g_itemAnim[i]);
+        if(ip < 0.01f) continue;
+        V2 itemP = menuItemPos(i, openProg);
+        float hue = fmod(MENU_ITEMS[i].hue + t * 20.f, 360.f);
+        SDL_Color c = hsv(hue, 0.8f, 1.f);
+        c.a = (Uint8)(ip * 0.35f * 255.f);
+        SDL_Color ce = c; ce.a = 0;
+        // Draw the connector spoke
+        int steps = 12;
+        for(int s = 0; s < steps; ++s){
+            float tf0 = (float)s/steps, tf1 = (float)(s+1)/steps;
+            V2 p0 = orig + (itemP - orig) * tf0;
+            V2 p1 = orig + (itemP - orig) * tf1;
+            SDL_Color sc = c; sc.a = (Uint8)(c.a * tf0);
+            stroke(r, p0, p1, 0.8f, ce, sc);
+        }
+    }
+}
+
+// Draw the full radial menu
+void drawRadialMenu(SDL_Renderer* r, float t, float uiAlpha, float bass, float overall) {
+    float alpha = uiAlpha;
+    if(alpha < 0.01f) return;
+
+    // Trigger button pulse (always visible, subtly)
+    g_menuBtnPulse = t;
+    float pulse = sinf(g_menuBtnPulse * 2.f) * 0.15f + 0.85f;
+    float btnHue = fmod(t * 30.f, 360.f);
+    // The button glows stronger when open
+    float btnGlow = 0.4f + g_menuOpen * 0.7f;
+    float btnR = MENU_BTN_R * (1.f + bass * 0.12f + (g_menuOpen > 0.5f ? 0.05f : 0.f));
+
+    // Draw ripples behind everything
+    drawMenuRipples(r);
+
+    // Arc connectors
+    drawMenuArcs(r, g_menuOpen, t);
+
+    // Draw each menu item
+    for(int i = 0; i < MENU_ITEM_COUNT; ++i){
+        float ip = clamp01(g_itemAnim[i]);
+        if(ip < 0.01f) continue;
+        V2 pos = menuItemPos(i, g_menuOpen);
+        float hue = fmod(MENU_ITEMS[i].hue + t * 15.f, 360.f);
+        // Extra glow if hovered
+        bool hov = (g_menuHover == i);
+        float glowStr = hov ? 1.2f : 0.5f;
+        float itemAlpha = ip * alpha;
+        SDL_Color col = hsv(hue, 0.9f, 1.f);
+        drawGlowCircle(r, pos, MENU_ITEM_R * (hov ? 1.15f : 1.f),
+                       col, glowStr, itemAlpha, "");
+        // Label always below button
+        if(g_fontSm && ip > 0.3f){
+            SDL_Color tc = col; tc.a = (Uint8)(itemAlpha * ip * 255.f);
+            drawText(r, g_fontSm, MENU_ITEMS[i].label,
+                     (int)pos.x, (int)(pos.y + MENU_ITEM_R + 4.f), tc, true);
+        }
+        // Icon in center
+        if(g_font && ip > 0.5f){
+            SDL_Color ic = {255,255,255,(Uint8)(itemAlpha * ip * 255.f)};
+            drawText(r, g_fontSm, MENU_ITEMS[i].icon,
+                     (int)pos.x, (int)(pos.y - 7.f), ic, true);
+        }
+    }
+
+    // Draw trigger button on top of everything
+    SDL_Color trigCol = hsv(btnHue, g_menuOpen > 0.5f ? 0.5f : 0.8f, 1.f);
+    drawGlowCircle(r, {MENU_BTN_X, MENU_BTN_Y}, btnR * pulse,
+                   trigCol, btnGlow, alpha, "");
+    drawHamburgerIcon(r, {MENU_BTN_X, MENU_BTN_Y}, g_menuOpen, alpha, btnHue);
+}
+
+// Hit test: is (mx,my) over the trigger button?
+bool hitMenuBtn(int mx, int my){
+    float dx = mx - MENU_BTN_X, dy = my - MENU_BTN_Y;
+    return sqrtf(dx*dx+dy*dy) <= MENU_BTN_R + 6.f;
+}
+
+// Hit test: is (mx,my) over menu item i?
+bool hitMenuItem(int mx, int my, int i, float openProg){
+    if(openProg < 0.1f) return false;
+    V2 pos = menuItemPos(i, openProg);
+    float dx = mx - pos.x, dy = my - pos.y;
+    return sqrtf(dx*dx+dy*dy) <= MENU_ITEM_R + 4.f;
+}
+
+// Returns hovered item index, or -1
+int menuHoverTest(int mx, int my, float openProg){
+    if(openProg < 0.2f) return -1;
+    for(int i=0;i<MENU_ITEM_COUNT;++i)
+        if(hitMenuItem(mx,my,i,openProg)) return i;
+    return -1;
+}
+
+void toggleMenu(float t) {
+    g_menuTarget = !g_menuTarget;
+    // Emit ripple rings
+    for(int i=0;i<3;++i)
+        g_menuRipples.push_back({MENU_BTN_R * (1.f + i * 0.3f),
+                                  0.9f - i * 0.2f,
+                                  fmod(t * 60.f + i * 40.f, 360.f)});
+}
+
+void updateMenu(float dt) {
+    float speed = 3.5f;  // slower open/close — more frames to enjoy
+    float target = g_menuTarget ? 1.f : 0.f;
+    g_menuOpen = lerp(g_menuOpen, target, dt * speed);
+    if(g_menuOpen < 0.001f) g_menuOpen = 0.f;
+    if(g_menuOpen > 0.999f) g_menuOpen = 1.f;
+
+    // Stagger each item — wider window so items visibly cascade one by one
+    for(int i=0;i<MENU_ITEM_COUNT;++i){
+        // Opening: item i starts moving after a delay proportional to its index
+        // Closing: reverse order (last item retracts first)
+        float staggerOpen  = i * 0.10f;   // 100ms stagger between items
+        float staggerClose = (MENU_ITEM_COUNT-1-i) * 0.08f;
+        float localT, localClose;
+        if(g_menuTarget){
+            // Scale menuOpen (0→1) into per-item window
+            localT = clamp01((g_menuOpen * (1.f + staggerOpen * MENU_ITEM_COUNT) - staggerOpen)
+                             / 1.f);
+            g_itemAnim[i] = springEase(localT);
+        } else {
+            localClose = clamp01(((1.f - g_menuOpen) * (1.f + staggerClose * MENU_ITEM_COUNT)
+                                  - staggerClose));
+            g_itemAnim[i] = clamp01(1.f - localClose * 1.6f);
+        }
+    }
+}
+
+// ── PANEL SYSTEM (library list / playlist list) ───────────────────────────────
+enum class UIPanel { None, Library, Playlists };
+static UIPanel  g_panel      = UIPanel::None;
+static UIPanel  g_prevPanel  = UIPanel::None;
+static int      g_libScroll  = 0;
+static int      g_plScroll   = 0;
+static int      g_selectedPL = -1;
+static char     g_newPLName[128] = "New Playlist";
+static bool     g_namingPL   = false;
+static int      g_hoverSong  = -1;
+static bool     g_uiVisible  = true;
+static float    g_idleTimer  = 0.f;
+
+// Panel build animation
+static float g_panelBuildT   = 0.f;
+static float g_panelBuildSpd = 0.55f;  // full build takes ~1.8 seconds
+static bool  g_panelBuilding = false;
+
+// Naming overlay build animation
+static float g_namingBuildT  = 0.f;
+static bool  g_namingBuilding= false;
+
+// Glitch character set for the type-on header effect
+static const char* GLITCH_CHARS = "!@#$%^&*<>?/\\|[]{}~`01ABCDEFabcdef";
+inline char glitchChar(float seed){
+    int len = 34;
+    return GLITCH_CHARS[(int)(fabsf(sinf(seed*7.3f))*len)%len];
+}
+
+// Type-on with heavy glitch leading edge — each char cycles through noise before resolving
+std::string buildTypeOn(const std::string& target, float progress, float t){
+    int total = (int)target.size();
+    std::string out;
+    for(int i=0;i<total;++i){
+        float charT = progress * (total + 6) - i;   // leading edge moves left-to-right
+        if(charT < 0.f){
+            out += ' ';
+        } else if(charT < 2.f){
+            // Heavy glitch zone — cycles fast
+            out += glitchChar(t * 18.f + i * 3.7f);
+        } else if(charT < 3.5f){
+            // Settling — slower glitch
+            out += glitchChar(t * 6.f + i * 1.9f);
+        } else {
+            out += target[i];
+        }
+    }
+    return out;
+}
+
+static constexpr int PANEL_W      = 320;
+static constexpr int ROW_H        = 32;
+static constexpr int VISIBLE_ROWS = 14;
+
+bool inRect(int mx,int my,SDL_Rect r){
+    return mx>=r.x&&mx<r.x+r.w&&my>=r.y&&my<r.y+r.h;
+}
+
+// Horizontal scanline that sweeps down the panel during build
+void drawScanSweep(SDL_Renderer* r, int px, int py, int pw, int ph,
+                   float progress, float t, float hue){
+    if(progress <= 0.f || progress >= 1.f) return;
+    float sweepY = py + progress * ph;
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    // Thick glowing horizontal bar
+    for(int layer=0;layer<6;++layer){
+        float lf = (float)layer/6.f;
+        float lh = (6.f - layer) * 3.f;
+        SDL_Color c = hsv(fmod(hue + layer*12.f, 360.f), 0.9f, 1.f);
+        c.a = (Uint8)((1.f-lf)*(1.f-lf) * 180.f);
+        SDL_FRect sr={(float)px, sweepY - lh/2.f, (float)pw, lh};
+        SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
+        SDL_RenderFillRectF(r,&sr);
+    }
+    // Bright core line
+    SDL_Color core = hsv(hue, 0.4f, 1.f); core.a = 220;
+    SDL_SetRenderDrawColor(r,core.r,core.g,core.b,core.a);
+    SDL_FRect coreLine={(float)px, sweepY-1.f, (float)pw, 2.f};
+    SDL_RenderFillRectF(r,&coreLine);
+}
+
+// Horizontal noise fill — random pixel static that resolves into solid color
+// Used to make each row materialise from noise
+void drawNoiseRow(SDL_Renderer* r, int x, int y, int w, int h,
+                  float noiseAmt, float t, float hue, Uint8 alpha){
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    int cols = w / 4;
+    for(int c=0;c<cols;++c){
+        float chance = sinf(c * 2.3f + t * 28.f + hue) * 0.5f + 0.5f;
+        if(chance > (1.f - noiseAmt)){
+            float bright = chance * noiseAmt;
+            SDL_Color col = hsv(fmod(hue + c*4.f, 360.f), 0.7f, 1.f);
+            col.a = (Uint8)(bright * alpha * 0.6f);
+            SDL_SetRenderDrawColor(r,col.r,col.g,col.b,col.a);
+            SDL_FRect dot={(float)(x + c*4), (float)y, 3.f, (float)h};
+            SDL_RenderFillRectF(r,&dot);
+        }
+    }
+}
+
+// Draw an animated self-building panel border with double-trace and glow dot
+void drawBuildingBorder(SDL_Renderer* r, int x, int y, int w, int h,
+                        float progress, float t, SDL_Color col){
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    float perim = 2.f*(w+h);
+    float drawn = progress * perim;
+
+    // Ghost trailing border at reduced opacity — shows full outline early
+    SDL_Color ghost = col; ghost.a = (Uint8)(col.a * 0.12f);
+    int gsegs=60;
+    for(int i=0;i<gsegs;++i){
+        float a0=(float)i/gsegs, a1=(float)(i+1)/gsegs;
+        // Map 0-1 around the rectangle perimeter
+        auto perimPt=[&](float u)->V2{
+            float d=u*perim;
+            if(d<w) return{(float)(x+d),(float)y};
+            d-=w; if(d<h) return{(float)(x+w),(float)(y+d)};
+            d-=h; if(d<w) return{(float)(x+w-d),(float)(y+h)};
+            d-=w; return{(float)x,(float)(y+h-(d))};
+        };
+        V2 p0=perimPt(a0), p1=perimPt(a1);
+        stroke(r,p0,p1,0.8f,ghost,ghost);
+    }
+
+    // Main drawing trace
+    auto drawSegment=[&](float startPerim, float endPerim){
+        if(endPerim<=0||startPerim>=perim) return;
+        startPerim=std::max(0.f,startPerim);
+        endPerim=std::min(endPerim,perim);
+        int steps=std::max(2,(int)((endPerim-startPerim)/3.f));
+        for(int s=0;s<steps;++s){
+            float d0=startPerim+(endPerim-startPerim)*(float)s/steps;
+            float d1=startPerim+(endPerim-startPerim)*(float)(s+1)/steps;
+            auto pt=[&](float d)->V2{
+                if(d<w) return{(float)(x+d),(float)y};
+                d-=w; if(d<h) return{(float)(x+w),(float)(y+d)};
+                d-=h; if(d<w) return{(float)(x+w-d),(float)(y+h)};
+                d-=w; return{(float)x,(float)(y+h-d)};
+            };
+            float tf=(float)s/steps;
+            SDL_Color c=col; c.a=(Uint8)(col.a*(0.5f+tf*0.5f));
+            stroke(r,pt(d0),pt(d1),2.f,c,c);
+        }
+    };
+    drawSegment(0, drawn);
+
+    // Bright glow dot at the drawing tip
+    if(progress > 0.f && progress < 1.f){
+        auto tipPt=[&](float d)->V2{
+            if(d<w) return{(float)(x+d),(float)y};
+            d-=w; if(d<h) return{(float)(x+w),(float)(y+d)};
+            d-=h; if(d<w) return{(float)(x+w-d),(float)(y+h)};
+            d-=w; return{(float)x,(float)(y+h-d)};
+        };
+        V2 tip=tipPt(std::min(drawn,perim-0.1f));
+        for(int g=4;g>=0;--g){
+            float gf=(float)g/4.f;
+            SDL_Color gc=col; gc.a=(Uint8)((1.f-gf)*(1.f-gf)*220.f);
+            softCircle(r,tip,4.f+gf*12.f,gc,{gc.r,gc.g,gc.b,0},12);
+        }
+    }
+}
+
+// Rich animated row — noise resolves into solid, then text types on
+void drawAnimatedRow(SDL_Renderer* r, int x, int y, int w,
+                     const std::string& label, bool selected, bool hovered,
+                     Uint8 alpha, float rowProgress, float t, float hue){
+    if(rowProgress <= 0.f) return;
+
+    // Phase 1 (0.0-0.35): noise static fills the row area
+    // Phase 2 (0.35-0.65): noise resolves, solid bg fades in, slide from left
+    // Phase 3 (0.65-1.0): text types on with glitch
+
+    float slideX_f = x - (1.f - smoothstep(clamp01((rowProgress-0.35f)/0.3f))) * 80.f;
+    int slideX = (int)slideX_f;
+
+    // Noise phase
+    if(rowProgress < 0.65f){
+        float noiseAmt = 1.f - clamp01((rowProgress - 0.f) / 0.65f);
+        drawNoiseRow(r, x-4, y, w+8, ROW_H-2, noiseAmt, t, hue, alpha);
+    }
+
+    // Solid background fades in during phase 2
+    float bgFade = smoothstep(clamp01((rowProgress - 0.35f) / 0.3f));
+    if(bgFade > 0.f){
+        Uint8 rowAlpha = (Uint8)(alpha * bgFade);
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        if(selected)      SDL_SetRenderDrawColor(r,40,80,160,rowAlpha);
+        else if(hovered)  SDL_SetRenderDrawColor(r,25,40,80,rowAlpha);
+        else              SDL_SetRenderDrawColor(r,8,8,20,rowAlpha);
+        SDL_Rect rc={slideX, y, w, ROW_H-2}; SDL_RenderFillRect(r,&rc);
+        SDL_SetRenderDrawColor(r,40,60,120,(Uint8)(rowAlpha/2));
+        SDL_RenderDrawRect(r,&rc);
+
+        // Color strip on left edge
+        SDL_Color tc = selected ? SDL_Color{100,180,255,rowAlpha}
+                                : SDL_Color{180,200,220,rowAlpha};
+        SDL_SetRenderDrawColor(r,tc.r,tc.g,tc.b,(Uint8)(rowAlpha*0.8f));
+        SDL_Rect strip={slideX+2,y+2,3,ROW_H-6}; SDL_RenderFillRect(r,&strip);
+
+        // Leading scan glow while sliding
+        if(rowProgress < 0.75f){
+            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+            SDL_Color scanC = hsv(hue, 1.f, 1.f);
+            scanC.a = (Uint8)(rowAlpha * (1.f - (rowProgress-0.35f)/0.4f));
+            for(int g=0;g<5;++g){
+                float gf=(float)g/5.f;
+                SDL_Rect glowR={slideX-g*3, y, 4, ROW_H-2};
+                SDL_Color gc=scanC; gc.a=(Uint8)(scanC.a*(1.f-gf));
+                SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+                SDL_RenderFillRect(r,&glowR);
+            }
+        }
+    }
+
+    // Text types on in phase 3
+    if(rowProgress > 0.65f){
+        float textFade = clamp01((rowProgress - 0.65f) / 0.35f);
+        float typeP = clamp01((rowProgress - 0.65f) / 0.22f);
+        std::string typed = buildTypeOn(label, typeP, t);
+        Uint8 ta = (Uint8)(alpha * textFade);
+        bool sel = selected;
+        SDL_Color tc = sel ? SDL_Color{100,180,255,ta} : SDL_Color{180,200,220,ta};
+        drawText(r, g_fontSm, typed, slideX+12, y+ROW_H/2-6, tc);
+    }
+}
+
+// ── DRAMATIC PANEL DRAW ───────────────────────────────────────────────────────
+// bp timeline (0→1 over ~1.8s):
+//   0.00–0.15  ghost outline appears
+//   0.05–0.40  border traces itself around the rectangle
+//   0.20–0.55  scanline sweeps top-to-bottom revealing bg + header
+//   0.35–0.55  header title glitches in
+//   0.45–1.00  rows materialise with staggered noise→solid→text sequence
+//   0.90–1.00  scrollbar fades in
+
+void drawLibraryPanel(SDL_Renderer* r, Uint8 alpha, float buildT, float t) {
+    float bp = clamp01(buildT);
+    int px = 10, py = 80;
+    int ph = VISIBLE_ROWS * ROW_H + 32;
+    float hue = fmod(t * 20.f, 360.f);
+
+    // Background — revealed progressively by scanline
+    float scanProg = clamp01((bp - 0.20f) / 0.40f);
+    float revealedH = scanProg * ph;
+    if(revealedH > 0.f){
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,3,5,14,(Uint8)(alpha*0.93f));
+        SDL_Rect bg={px,py,PANEL_W,(int)revealedH}; SDL_RenderFillRect(r,&bg);
+    }
+
+    // Scanline sweep
+    drawScanSweep(r, px, py, PANEL_W, ph, scanProg, t, hue);
+
+    // Animated border (starts early, finishes mid-way)
+    float borderProg = smoothstep(clamp01((bp - 0.05f) / 0.40f));
+    SDL_Color borderCol = hsv(hue, 0.85f, 1.f);
+    borderCol.a = (Uint8)(alpha * 0.95f);
+    drawBuildingBorder(r, px, py, PANEL_W, ph, borderProg, t, borderCol);
+
+    // Header bar — slides down from top after scanline reaches it
+    if(bp > 0.20f){
+        float hdrFade = smoothstep(clamp01((bp - 0.20f) / 0.20f));
+        int hdrSlide = (int)((1.f-hdrFade)*20.f);
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,20,50,105,(Uint8)(alpha*hdrFade*0.97f));
+        SDL_Rect hdr={px, py-hdrSlide, PANEL_W, 28}; SDL_RenderFillRect(r,&hdr);
+
+        // Header separator glow line
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+        SDL_Color hline = hsv(hue, 1.f, 1.f);
+        hline.a=(Uint8)(alpha*hdrFade);
+        // Draw as multi-layered glow
+        for(int g=0;g<4;++g){
+            float gf=(float)g/4.f;
+            SDL_Color gc=hline; gc.a=(Uint8)(hline.a*(1.f-gf*0.8f));
+            SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+            SDL_Rect hl={px, py+27-hdrSlide-g, PANEL_W, 1+g};
+            SDL_RenderFillRect(r,&hl);
+        }
+
+        // Type-on title — starts at 35%
+        if(bp > 0.35f){
+            float typeP = clamp01((bp - 0.35f) / 0.30f);
+            std::string fullTitle = "LIBRARY  [" + std::to_string(g_library.size()) + " TRACKS]";
+            std::string typed = buildTypeOn(fullTitle, typeP, t);
+            // Glow behind text
+            SDL_Color tglow = hsv(hue, 0.6f, 1.f);
+            tglow.a = (Uint8)(alpha * hdrFade * 0.4f);
+            for(int g=0;g<3;++g)
+                drawText(r,g_font,typed,px+8+g,py+6-hdrSlide,tglow,false);
+            SDL_Color tc = {160,220,255,(Uint8)(alpha*hdrFade)};
+            drawText(r, g_font, typed, px+8, py+6-hdrSlide, tc);
+        }
+    }
+
+    // Rows — each materialises individually
+    if(bp > 0.45f){
+        int listY = py + 30;
+        int visEnd = std::min(g_libScroll+VISIBLE_ROWS,(int)g_library.size());
+        for(int i = g_libScroll; i < visEnd; ++i){
+            int rowIdx = i - g_libScroll;
+            float rowStart = 0.45f + rowIdx * 0.032f;
+            float rowEnd   = rowStart + 0.40f;
+            float rowProg  = clamp01((bp - rowStart) / (rowEnd - rowStart));
+            int ry = listY + rowIdx * ROW_H;
+            float rowHue = fmod(hue + rowIdx * 18.f, 360.f);
+            drawAnimatedRow(r, px+4, ry, PANEL_W-8,
+                            g_library[i].title,
+                            i==g_currentSong, i==g_hoverSong,
+                            alpha, rowProg, t, rowHue);
+        }
+
+        // Scrollbar fades in near end
+        if(bp > 0.90f && (int)g_library.size()>VISIBLE_ROWS){
+            float sbFade = clamp01((bp-0.90f)/0.10f);
+            float st=(float)g_libScroll/g_library.size();
+            float sh=(float)VISIBLE_ROWS/g_library.size();
+            int sbY=py+30+(int)(VISIBLE_ROWS*ROW_H*st);
+            int sbH=std::max(20,(int)(VISIBLE_ROWS*ROW_H*sh));
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color sbc = hsv(hue,0.7f,1.f); sbc.a=(Uint8)(alpha*sbFade*0.8f);
+            SDL_SetRenderDrawColor(r,sbc.r,sbc.g,sbc.b,sbc.a);
+            SDL_Rect sb={px+PANEL_W-8,sbY,5,sbH}; SDL_RenderFillRect(r,&sb);
+        }
+    }
+
+    // Corner accent sparks — little decorative touches during build
+    if(bp > 0.05f && bp < 0.6f){
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        float sparkT = clamp01(bp/0.6f);
+        for(int corner=0;corner<4;++corner){
+            float cx2 = (corner%2==0) ? (float)px : (float)(px+PANEL_W);
+            float cy2 = (corner<2)    ? (float)py : (float)(py+ph);
+            float sparkAlpha = sinf(sparkT*(float)M_PI) * 0.9f;
+            for(int sp=0;sp<5;++sp){
+                float sa = (float)sp/5.f * 2*(float)M_PI + t*8.f + corner*1.57f;
+                float sr = 4.f + sp*6.f*sparkT;
+                SDL_Color sc = hsv(fmod(hue+corner*90.f+sp*20.f,360.f),0.9f,1.f);
+                sc.a=(Uint8)(sparkAlpha*(1.f-(float)sp/5.f)*200.f);
+                softCircle(r,{cx2+cosf(sa)*sr*0.3f,cy2+sinf(sa)*sr*0.3f},
+                           2.f,sc,{sc.r,sc.g,sc.b,0},6);
+            }
+        }
+    }
+}
+
+void drawPlaylistPanel(SDL_Renderer* r, Uint8 alpha, float buildT, float t) {
+    float bp = clamp01(buildT);
+    int px = 10, py = 80;
+    int rowCount = (int)g_playlists.size() + 1;
+    int ph = std::min(rowCount * ROW_H + 32, VISIBLE_ROWS * ROW_H + 32);
+    float hue = fmod(t * 20.f + 270.f, 360.f); // purple tone
+
+    float scanProg = clamp01((bp - 0.20f) / 0.40f);
+    float revealedH = scanProg * ph;
+    if(revealedH > 0.f){
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,5,2,14,(Uint8)(alpha*0.93f));
+        SDL_Rect bg={px,py,PANEL_W,(int)revealedH}; SDL_RenderFillRect(r,&bg);
+    }
+    drawScanSweep(r, px, py, PANEL_W, ph, scanProg, t, hue);
+
+    float borderProg = smoothstep(clamp01((bp-0.05f)/0.40f));
+    SDL_Color borderCol = hsv(hue, 0.85f, 1.f);
+    borderCol.a = (Uint8)(alpha*0.95f);
+    drawBuildingBorder(r, px, py, PANEL_W, ph, borderProg, t, borderCol);
+
+    if(bp > 0.20f){
+        float hdrFade = smoothstep(clamp01((bp-0.20f)/0.20f));
+        int hdrSlide = (int)((1.f-hdrFade)*20.f);
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,30,10,75,(Uint8)(alpha*hdrFade*0.97f));
+        SDL_Rect hdr={px, py-hdrSlide, PANEL_W, 28}; SDL_RenderFillRect(r,&hdr);
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+        for(int g=0;g<4;++g){
+            SDL_Color gc=hsv(hue,1.f,1.f); gc.a=(Uint8)(alpha*hdrFade*(1.f-g*0.2f));
+            SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+            SDL_Rect hl={px, py+27-hdrSlide-g, PANEL_W, 1+g};
+            SDL_RenderFillRect(r,&hl);
+        }
+        if(bp > 0.35f){
+            float typeP = clamp01((bp-0.35f)/0.30f);
+            std::string typed = buildTypeOn("PLAYLISTS  [LOADED]", typeP, t);
+            SDL_Color tglow=hsv(hue,0.5f,1.f); tglow.a=(Uint8)(alpha*hdrFade*0.4f);
+            for(int g=0;g<3;++g)
+                drawText(r,g_font,typed,px+8+g,py+6-hdrSlide,tglow,false);
+            SDL_Color tc={210,170,255,(Uint8)(alpha*hdrFade)};
+            drawText(r,g_font,typed,px+8,py+6-hdrSlide,tc);
+        }
+    }
+
+    if(bp > 0.45f){
+        int listY = py+30;
+        float row0Prog = clamp01((bp-0.45f)/0.40f);
+        drawAnimatedRow(r,px+4,listY,PANEL_W-8,"ALL TRACKS",
+                        g_currentPL==-1,false,alpha,row0Prog,t,hue);
+        for(int i=0;i<(int)g_playlists.size();++i){
+            float rowStart=0.45f+(i+1)*0.042f;
+            float rowProg=clamp01((bp-rowStart)/0.40f);
+            int ry=listY+(i+1)*ROW_H;
+            if(ry>py+ph-ROW_H) break;
+            std::string label=g_playlists[i].name
+                             +" ["+std::to_string(g_playlists[i].songIndices.size())+"]";
+            drawAnimatedRow(r,px+4,ry,PANEL_W-8,label,
+                            i==g_currentPL,false,alpha,
+                            rowProg,t,fmod(hue+(i+1)*25.f,360.f));
+        }
+    }
+
+    // Corner sparks
+    if(bp > 0.05f && bp < 0.6f){
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        float sparkT=clamp01(bp/0.6f);
+        for(int corner=0;corner<4;++corner){
+            float cx2=(corner%2==0)?(float)px:(float)(px+PANEL_W);
+            float cy2=(corner<2)?(float)py:(float)(py+ph);
+            float sparkAlpha=sinf(sparkT*(float)M_PI)*0.9f;
+            for(int sp=0;sp<5;++sp){
+                float sa=(float)sp/5.f*2*(float)M_PI+t*8.f+corner*1.57f;
+                float sr=4.f+sp*6.f*sparkT;
+                SDL_Color sc=hsv(fmod(hue+corner*90.f+sp*20.f,360.f),0.9f,1.f);
+                sc.a=(Uint8)(sparkAlpha*(1.f-(float)sp/5.f)*200.f);
+                softCircle(r,{cx2+cosf(sa)*sr*0.3f,cy2+sinf(sa)*sr*0.3f},
+                           2.f,sc,{sc.r,sc.g,sc.b,0},6);
+            }
+        }
+    }
+}
+
+int libraryClickRow(int mx,int my){
+    if(g_panel!=UIPanel::Library)return -1;
+    int px=10,py=80,listY=py+30;
+    if(mx<px||mx>px+PANEL_W)return -1;
+    int row=(my-listY)/ROW_H;
+    int idx=g_libScroll+row;
+    if(row<0||row>=VISIBLE_ROWS||idx>=(int)g_library.size())return -1;
+    return idx;
+}
+int playlistClickRow(int mx,int my){
+    if(g_panel!=UIPanel::Playlists)return -2;
+    int px=10,py=80,listY=py+30;
+    if(mx<px||mx>px+PANEL_W)return -2;
+    int row=(my-listY)/ROW_H;
+    if(row<0)return -2;
+    if(row==0)return -1;
+    return row-1;
+}
+bool onProgressBar(int mx,int my,int ww,int wh){
+    return mx>=80&&mx<=ww-80&&my>=wh-32&&my<=wh-20;
+}
+
+// ── BOTTOM NOW-PLAYING BAR ─────────────────────────────────────────────────────
+void drawNowPlayingBar(SDL_Renderer* r, int ww, int wh, Uint8 alpha, float t, float bass) {
+    if(alpha==0) return;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+
+    // Frosted dark bar
+    SDL_SetRenderDrawColor(r,4,4,12,(Uint8)(alpha*0.88f));
+    SDL_Rect botBar={0,wh-44,ww,44};SDL_RenderFillRect(r,&botBar);
+    // Top edge glow — cycles hue
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    SDL_Color edgeC = hsv(fmod(t*18.f,360.f), 0.8f, 0.7f);
+    edgeC.a = (Uint8)(alpha * 0.7f);
+    SDL_SetRenderDrawColor(r,edgeC.r,edgeC.g,edgeC.b,edgeC.a);
+    SDL_Rect edgeLine={0,wh-45,ww,1};SDL_RenderFillRect(r,&edgeLine);
+
+    // Progress bar
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    double pos=0,dur=1;
+    if(g_music){pos=Mix_GetMusicPosition(g_music);dur=Mix_MusicDuration(g_music);}
+    if(dur<=0)dur=1;
+    float prog=(float)(pos/dur);
+    int pbX=90,pbY=wh-28,pbW=ww-180,pbH=6;
+    SDL_SetRenderDrawColor(r,20,20,40,alpha);
+    SDL_Rect pbBg={pbX,pbY,pbW,pbH};SDL_RenderFillRect(r,&pbBg);
+
+    // Gradient fill for the progress bar
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    SDL_Color pfc = hsv(fmod(t*20.f,360.f),0.9f,1.f); pfc.a=alpha;
+    SDL_SetRenderDrawColor(r,pfc.r,pfc.g,pfc.b,pfc.a);
+    SDL_Rect pbFill={pbX,pbY,(int)(pbW*prog),pbH};SDL_RenderFillRect(r,&pbFill);
+
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r,80,140,200,(Uint8)(alpha*0.5f));
+    SDL_RenderDrawRect(r,&pbBg);
+
+    // Playhead thumb
+    int thumbX=pbX+(int)(pbW*prog)-4;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    SDL_Color tc2 = hsv(fmod(t*20.f+40.f,360.f),0.6f,1.f); tc2.a=alpha;
+    SDL_SetRenderDrawColor(r,tc2.r,tc2.g,tc2.b,tc2.a);
+    SDL_Rect thumb={thumbX,pbY-3,8,pbH+6};SDL_RenderFillRect(r,&thumb);
+
+    // Song title — centered
+    std::string nowPlaying="No track loaded";
+    if(g_currentSong>=0&&g_currentSong<(int)g_library.size())
+        nowPlaying=g_library[g_currentSong].title;
+    else if(g_music) nowPlaying="Playing...";
+    SDL_Color titleC={180,220,255,alpha};
+    drawText(r,g_font,nowPlaying,ww/2,wh-42,titleC,true);
+}
+
+// New playlist name input overlay — dramatic build
+void drawNamingOverlay(SDL_Renderer* r, int ww, int wh, Uint8 alpha, float buildT, float t) {
+    if(!g_namingPL) return;
+    float bp = clamp01(buildT);
+    int ox=ww/2-180, oy=wh/2-60;
+    int ow=360, oh=110;
+    float hue = fmod(t*28.f + 80.f, 360.f);
+
+    // Dim the screen behind it
+    float dimFade = smoothstep(clamp01(bp*4.f));
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r,0,0,0,(Uint8)(dimFade*120.f));
+    SDL_RenderFillRect(r,nullptr);
+
+    // Scanline sweeps the overlay
+    float scanProg = clamp01((bp-0.15f)/0.45f);
+    float revH = scanProg * oh;
+    if(revH>0.f){
+        SDL_SetRenderDrawColor(r,4,4,14,(Uint8)(alpha*0.96f));
+        SDL_Rect bg={ox,oy,ow,(int)revH}; SDL_RenderFillRect(r,&bg);
+    }
+    drawScanSweep(r,ox,oy,ow,oh,scanProg,t,hue);
+
+    // Border traces
+    float borderProg = smoothstep(clamp01((bp-0.05f)/0.45f));
+    SDL_Color bc = hsv(hue,0.9f,1.f); bc.a=(Uint8)(alpha*0.95f);
+    drawBuildingBorder(r,ox,oy,ow,oh,borderProg,t,bc);
+
+    // Corner sparks
+    if(bp > 0.05f && bp < 0.65f){
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        float sparkT=clamp01(bp/0.65f);
+        for(int corner=0;corner<4;++corner){
+            float cx2=(corner%2==0)?(float)ox:(float)(ox+ow);
+            float cy2=(corner<2)?(float)oy:(float)(oy+oh);
+            float sa2=sinf(sparkT*(float)M_PI)*180.f;
+            for(int sp=0;sp<4;++sp){
+                float sa=(float)sp/4.f*2*(float)M_PI+t*10.f+corner*1.57f;
+                SDL_Color sc=hsv(fmod(hue+corner*90.f+sp*30.f,360.f),1.f,1.f);
+                sc.a=(Uint8)(sa2*(1.f-(float)sp/4.f));
+                softCircle(r,{cx2+cosf(sa)*sp*3.f,cy2+sinf(sa)*sp*3.f},
+                           2.f+sp,sc,{sc.r,sc.g,sc.b,0},6);
+            }
+        }
+    }
+
+    // Prompt type-on
+    if(bp > 0.35f){
+        float fade=smoothstep(clamp01((bp-0.35f)/0.25f));
+        float typeP=clamp01((bp-0.35f)/0.25f);
+        std::string typed=buildTypeOn("> ENTER PLAYLIST NAME:", typeP, t);
+        SDL_Color tglow=hsv(hue,0.5f,1.f); tglow.a=(Uint8)(alpha*fade*0.35f);
+        for(int g=0;g<3;++g) drawText(r,g_font,typed,ox+12+g,oy+8,tglow,false);
+        drawText(r,g_font,typed,ox+12,oy+8,{180,220,255,(Uint8)(alpha*fade)});
+    }
+
+    // Input box assembles
+    if(bp > 0.58f){
+        float fade=smoothstep(clamp01((bp-0.58f)/0.25f));
+        // Glowing input box
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,12,20,45,(Uint8)(200*fade));
+        SDL_Rect inp={ox+10,oy+34,340,34}; SDL_RenderFillRect(r,&inp);
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        // Multi-layer border glow
+        for(int g=0;g<4;++g){
+            SDL_Color gc=hsv(hue,0.9f,1.f);
+            gc.a=(Uint8)(255*fade*(1.f-g*0.22f));
+            SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+            SDL_Rect inpG={ox+10-g,oy+34-g,340+g*2,34+g*2};
+            SDL_RenderDrawRect(r,&inpG);
+        }
+        // Text with blinking cursor
+        std::string display=std::string(g_newPLName);
+        if(fmod(t,1.f)<0.55f) display+="_";
+        // Glow under text
+        SDL_Color tglow=hsv(hue,0.4f,1.f); tglow.a=(Uint8)(alpha*fade*0.3f);
+        for(int g=0;g<3;++g) drawText(r,g_font,display,ox+16+g,oy+40,tglow,false);
+        drawText(r,g_font,display,ox+16,oy+40,{220,240,255,(Uint8)(alpha*fade)});
+
+        // Hint
+        float hintFade=clamp01((bp-0.80f)/0.15f);
+        if(hintFade>0.f)
+            drawText(r,g_fontSm,"[ ENTER ] confirm    [ ESC ] cancel",
+                     ox+10,oy+78,{100,130,170,(Uint8)(160*hintFade)});
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPOTIFY IMPORT SYSTEM
+// Flow: credentials dialog → OAuth browser → token capture → fetch playlists
+//       → pick playlist → yt-dlp download queue → auto-add to library
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+static std::string g_spotClientId;
+static std::string g_spotClientSecret;
+static std::string g_spotAccessToken;
+
+static std::string getExeDir(){
+    char buf[MAX_PATH]; GetModuleFileNameA(nullptr,buf,MAX_PATH);
+    std::string s(buf); auto sl=s.find_last_of("\\/");
+    return s.substr(0,sl+1);
+}
+static std::string spotConfigPath(){ return getExeDir()+"spotify_config.txt"; }
+
+void saveSpotifyConfig(){
+    std::ofstream f(spotConfigPath());
+    if(!f) return;
+    f<<"CLIENT_ID "<<g_spotClientId<<"\n";
+    f<<"CLIENT_SECRET "<<g_spotClientSecret<<"\n";
+}
+void loadSpotifyConfig(){
+    std::ifstream f(spotConfigPath());
+    if(!f) return;
+    std::string line;
+    while(std::getline(f,line)){
+        if(line.substr(0,10)=="CLIENT_ID ") g_spotClientId=line.substr(10);
+        if(line.substr(0,14)=="CLIENT_SECRET ") g_spotClientSecret=line.substr(14);
+    }
+}
+
+// ── TINY HTTP HELPERS (WinHTTP, ships with Windows) ──────────────────────────
+
+// Synchronous HTTPS GET — returns response body or "" on error
+std::string httpsGet(const std::string& host, const std::string& path,
+                     const std::string& authHeader=""){
+    HINTERNET hSession=WinHttpOpen(L"AcidKaleido/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+    if(!hSession) return "";
+    std::wstring whost(host.begin(),host.end());
+    HINTERNET hConn=WinHttpConnect(hSession,whost.c_str(),INTERNET_DEFAULT_HTTPS_PORT,0);
+    if(!hConn){WinHttpCloseHandle(hSession);return "";}
+    std::wstring wpath(path.begin(),path.end());
+    HINTERNET hReq=WinHttpOpenRequest(hConn,L"GET",wpath.c_str(),
+        nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if(!hReq){WinHttpCloseHandle(hConn);WinHttpCloseHandle(hSession);return "";}
+    if(!authHeader.empty()){
+        std::wstring wauth(authHeader.begin(),authHeader.end());
+        WinHttpAddRequestHeaders(hReq,wauth.c_str(),(ULONG)-1,
+            WINHTTP_ADDREQ_FLAG_ADD);
+    }
+    if(!WinHttpSendRequest(hReq,WINHTTP_NO_ADDITIONAL_HEADERS,0,
+        WINHTTP_NO_REQUEST_DATA,0,0,0)){
+        WinHttpCloseHandle(hReq);WinHttpCloseHandle(hConn);
+        WinHttpCloseHandle(hSession);return "";
+    }
+    WinHttpReceiveResponse(hReq,nullptr);
+    std::string body;
+    DWORD avail=0;
+    while(WinHttpQueryDataAvailable(hReq,&avail)&&avail>0){
+        std::vector<char> buf(avail+1,0);
+        DWORD read=0;
+        WinHttpReadData(hReq,buf.data(),avail,&read);
+        body.append(buf.data(),read);
+    }
+    WinHttpCloseHandle(hReq);WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSession);
+    return body;
+}
+
+// HTTPS POST with body
+std::string httpsPost(const std::string& host,const std::string& path,
+                      const std::string& body,const std::string& contentType,
+                      const std::string& authHeader=""){
+    HINTERNET hSession=WinHttpOpen(L"AcidKaleido/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+    if(!hSession) return "";
+    std::wstring whost(host.begin(),host.end());
+    HINTERNET hConn=WinHttpConnect(hSession,whost.c_str(),INTERNET_DEFAULT_HTTPS_PORT,0);
+    if(!hConn){WinHttpCloseHandle(hSession);return "";}
+    std::wstring wpath(path.begin(),path.end());
+    HINTERNET hReq=WinHttpOpenRequest(hConn,L"POST",wpath.c_str(),
+        nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if(!hReq){WinHttpCloseHandle(hConn);WinHttpCloseHandle(hSession);return "";}
+    std::wstring wct(contentType.begin(),contentType.end());
+    WinHttpAddRequestHeaders(hReq,
+        (L"Content-Type: "+wct).c_str(),(ULONG)-1,WINHTTP_ADDREQ_FLAG_ADD);
+    if(!authHeader.empty()){
+        std::wstring wauth(authHeader.begin(),authHeader.end());
+        WinHttpAddRequestHeaders(hReq,wauth.c_str(),(ULONG)-1,WINHTTP_ADDREQ_FLAG_ADD);
+    }
+    WinHttpSendRequest(hReq,WINHTTP_NO_ADDITIONAL_HEADERS,0,
+        (LPVOID)body.c_str(),(DWORD)body.size(),(DWORD)body.size(),0);
+    WinHttpReceiveResponse(hReq,nullptr);
+    std::string resp;
+    DWORD avail=0;
+    while(WinHttpQueryDataAvailable(hReq,&avail)&&avail>0){
+        std::vector<char> buf(avail+1,0);DWORD read=0;
+        WinHttpReadData(hReq,buf.data(),avail,&read);
+        resp.append(buf.data(),read);
+    }
+    WinHttpCloseHandle(hReq);WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSession);
+    return resp;
+}
+
+// ── TINY JSON FIELD EXTRACTOR (no dependency) ────────────────────────────────
+// Extracts the value of "key":"value" or "key":value from a JSON string
+// Handles both string values and array/object scanning.
+std::string jsonField(const std::string& json, const std::string& key){
+    std::string search="\""+key+"\"";
+    size_t pos=json.find(search);
+    if(pos==std::string::npos) return "";
+    pos+=search.size();
+    // skip whitespace and colon
+    while(pos<json.size()&&(json[pos]==' '||json[pos]=='\t'||json[pos]==':')) ++pos;
+    if(pos>=json.size()) return "";
+    if(json[pos]=='"'){
+        // string value
+        ++pos; std::string val;
+        while(pos<json.size()&&json[pos]!='"'){
+            if(json[pos]=='\\'&&pos+1<json.size()){++pos;}
+            val+=json[pos++];
+        }
+        return val;
+    } else {
+        // number/bool/null
+        size_t end=json.find_first_of(",}\n]",pos);
+        return json.substr(pos,end-pos);
+    }
+}
+
+// Extract all values of a key across a JSON array of objects
+std::vector<std::string> jsonArrayField(const std::string& json, const std::string& key){
+    std::vector<std::string> results;
+    size_t pos=0;
+    std::string search="\""+key+"\"";
+    while((pos=json.find(search,pos))!=std::string::npos){
+        pos+=search.size();
+        while(pos<json.size()&&(json[pos]==' '||json[pos]=='\t'||json[pos]==':'))++pos;
+        if(pos>=json.size()) break;
+        if(json[pos]=='"'){
+            ++pos; std::string val;
+            while(pos<json.size()&&json[pos]!='"'){
+                if(json[pos]=='\\'&&pos+1<json.size()){++pos;}
+                val+=json[pos++];
+            }
+            results.push_back(val);
+        }
+    }
+    return results;
+}
+
+// URL-encode a string for query params
+std::string urlEncode(const std::string& s){
+    std::string out; char hex[4];
+    for(unsigned char c:s){
+        if(isalnum(c)||c=='-'||c=='_'||c=='.'||c=='~') out+=c;
+        else{ snprintf(hex,sizeof(hex),"%%%02X",c); out+=hex; }
+    }
+    return out;
+}
+
+// Base64 encode (for client_id:client_secret Basic auth)
+static const char B64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+std::string base64(const std::string& s){
+    std::string out; int val=0,bits=-6;
+    for(unsigned char c:s){
+        val=(val<<8)+c; bits+=8;
+        while(bits>=0){ out+=B64[(val>>bits)&0x3F]; bits-=6; }
+    }
+    if(bits>-6) out+=B64[((val<<8)>>(bits+8))&0x3F];
+    while(out.size()%4) out+='=';
+    return out;
+}
+
+// ── OAUTH LOCAL SERVER ────────────────────────────────────────────────────────
+// Spins a TCP server on localhost:8888 and waits for the Spotify redirect.
+// Runs on a background thread; deposits the auth code into g_spotAuthCode.
+static std::string   g_spotAuthCode;
+static std::atomic<bool> g_spotCodeReady{false};
+static std::mutex    g_spotMtx;
+
+void oauthServerThread(){
+    WSADATA wsd; WSAStartup(MAKEWORD(2,2),&wsd);
+    SOCKET srv=socket(AF_INET,SOCK_STREAM,0);
+    sockaddr_in addr{}; addr.sin_family=AF_INET;
+    addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    addr.sin_port=htons(8888);
+    int yes=1; setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
+    if(bind(srv,(sockaddr*)&addr,sizeof(addr))!=0||listen(srv,1)!=0){
+        closesocket(srv); WSACleanup(); return;
+    }
+    // Wait up to 120s for Spotify to redirect
+    fd_set fds; FD_ZERO(&fds); FD_SET(srv,&fds);
+    timeval tv{120,0};
+    if(select(0,&fds,nullptr,nullptr,&tv)<=0){closesocket(srv);WSACleanup();return;}
+    SOCKET client=accept(srv,nullptr,nullptr);
+    char buf[4096]={};
+    recv(client,buf,sizeof(buf)-1,0);
+    std::string req(buf);
+    // Parse ?code=XXXX from GET line
+    auto codePos=req.find("code=");
+    if(codePos!=std::string::npos){
+        size_t end=req.find_first_of(" &\r\n",codePos+5);
+        std::string code=req.substr(codePos+5,end-codePos-5);
+        std::lock_guard<std::mutex> lk(g_spotMtx);
+        g_spotAuthCode=code;
+        g_spotCodeReady=true;
+    }
+    // Send a sick animated HTML response back to the browser
+    const char* html="HTTP/1.1 200 OK\r\nContent-Type:text/html\r\n\r\n"
+"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+"<title>ACID KALEIDO — Connected</title>"
+"<style>"
+"*{margin:0;padding:0;box-sizing:border-box}"
+"body{background:#000;color:#fff;font-family:monospace;overflow:hidden;height:100vh;display:flex;align-items:center;justify-content:center}"
+"canvas{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}"
+".ui{position:relative;z-index:10;text-align:center;padding:40px}"
+".title{font-size:2.8em;letter-spacing:0.3em;color:#00ffaa;text-shadow:0 0 30px #00ffaa,0 0 60px #00ff88;animation:pulse 2s ease-in-out infinite}"
+".sub{font-size:1em;letter-spacing:0.2em;color:#88ffcc;margin:18px 0 32px;opacity:0.8}"
+".bar-wrap{width:420px;margin:0 auto 18px;background:#0a1a10;border:1px solid #00ff88;border-radius:2px;overflow:hidden;box-shadow:0 0 20px #00ff4433}"
+".bar{height:14px;width:0%;background:linear-gradient(90deg,#00ff88,#00ffcc,#00aaff);animation:fill 4s cubic-bezier(0.1,0,0.2,1) forwards;box-shadow:0 0 12px #00ffaa}"
+".pct{font-size:0.85em;color:#00ff88;letter-spacing:0.15em;margin-bottom:24px}"
+".msg{font-size:0.75em;color:#446655;letter-spacing:0.12em;line-height:2}"
+".close{margin-top:28px;font-size:0.7em;color:#224433;letter-spacing:0.15em}"
+"@keyframes pulse{0%,100%{text-shadow:0 0 30px #00ffaa,0 0 60px #00ff88}50%{text-shadow:0 0 60px #00ffaa,0 0 120px #00ff88,0 0 200px #00ffcc}}"
+"@keyframes fill{0%{width:0%}60%{width:72%}80%{width:88%}92%{width:94%}100%{width:100%}}"
+"@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}"
+".line{opacity:0;animation:fadeIn 0.4s ease forwards}"
+".l1{animation-delay:0.3s}.l2{animation-delay:0.7s}.l3{animation-delay:1.1s}.l4{animation-delay:1.5s}.l5{animation-delay:2.2s}"
+"</style></head>"
+"<body>"
+"<canvas id='c'></canvas>"
+"<div class='ui'>"
+"  <div class='title'>ACID KALEIDO</div>"
+"  <div class='sub'>SPOTIFY LINK ESTABLISHED</div>"
+"  <div class='bar-wrap'><div class='bar'></div></div>"
+"  <div class='pct' id='pct'>0%</div>"
+"  <div class='msg'>"
+"    <div class='line l1'>&#x2714; OAuth token received</div>"
+"    <div class='line l2'>&#x2714; Credentials verified</div>"
+"    <div class='line l3'>&#x2714; Secure handshake complete</div>"
+"    <div class='line l4'>&#x2714; Returning to visualizer...</div>"
+"    <div class='line l5' style='color:#00ffaa'>&#x2605; Authorization complete</div>"
+"  </div>"
+"  <div class='close'>You can close this tab</div>"
+"</div>"
+"<script>"
+// Kaleidoscope canvas animation
+"var c=document.getElementById('c'),x=c.getContext('2d'),t=0;"
+"function rs(){c.width=window.innerWidth;c.height=window.innerHeight}"
+"rs();window.onresize=rs;"
+"function draw(){"
+"  requestAnimationFrame(draw);t+=0.012;"
+"  x.fillStyle='rgba(0,0,0,0.18)';x.fillRect(0,0,c.width,c.height);"
+"  var cx=c.width/2,cy=c.height/2,slices=8;"
+"  for(var s=0;s<slices;s++){"
+"    x.save();x.translate(cx,cy);x.rotate(s/slices*Math.PI*2+t*0.07);"
+"    if(s%2)x.scale(1,-1);"
+"    for(var i=0;i<40;i++){"
+"      var bt=i/40,ang=bt*Math.PI/slices;"
+"      var r0=20+Math.sin(t*1.5)*8,r1=r0+(0.3+Math.sin(t*2+i)*0.15)*280;"
+"      var hue=(t*60+bt*200+s*5)%360;"
+"      x.beginPath();"
+"      x.moveTo(Math.cos(ang)*r0,Math.sin(ang)*r0);"
+"      x.lineTo(Math.cos(ang)*r1,Math.sin(ang)*r1);"
+"      x.strokeStyle='hsla('+hue+',90%,60%,'+(0.08+Math.sin(t+i)*0.04)+')';"
+"      x.lineWidth=1+Math.sin(t*3+i)*1.5;"
+"      x.stroke();"
+"    }"
+"    x.restore();"
+"  }"
+"}"
+"draw();"
+// Percentage counter
+"var start=Date.now(),dur=4000;"
+"function tick(){"
+"  var p=Math.min(100,Math.floor((Date.now()-start)/dur*100));"
+"  document.getElementById('pct').textContent=p+'%';"
+"  if(p<100)setTimeout(tick,50);"
+"}"
+"tick();"
+"</script></body></html>";
+    send(client,html,(int)strlen(html),0);
+    closesocket(client); closesocket(srv); WSACleanup();
+}
+
+// ── SPOTIFY STATE MACHINE ─────────────────────────────────────────────────────
+enum class SpotState {
+    Idle,
+    CredentialsDialog,  // entering client ID / secret
+    WaitingAuth,        // browser opened, waiting for redirect
+    FetchingPlaylists,  // API call in progress
+    PlaylistPicker,     // user picks which playlist to import
+    Downloading,        // yt-dlp queue running
+    Done
+};
+
+struct SpotTrack { std::string title, artist, searchQuery, filePath, status; };
+struct SpotPlaylistInfo { std::string id, name; int total=0; };
+
+static SpotState  g_spotState     = SpotState::Idle;
+static float      g_spotBuildT    = 0.f;
+static bool       g_spotBuilding  = false;
+// Per-state build timers so fast state transitions don't kill animations
+static float      g_spotWaitBuildT = 0.f;
+
+// Credentials dialog fields
+static char g_spotIdBuf[256]     = {};
+static char g_spotSecretBuf[256] = {};
+static bool g_spotFocusId        = true; // which field has focus
+
+// Playlist picker
+static std::vector<SpotPlaylistInfo> g_spotPlaylists;
+static int  g_spotPlScroll  = 0;
+static int  g_spotPlHover   = -1;
+static std::string g_spotStatusMsg;
+// Fake loading bar timer — purely cosmetic drama
+static float g_spotFakeLoadT   = 0.f;   // 0→1 over 4 seconds
+static bool  g_spotFakeLoading = false;
+
+// Download queue
+static std::vector<SpotTrack>  g_spotTracks;
+static std::atomic<int>        g_spotDlIdx{0};   // which track is downloading
+static std::mutex              g_spotTrackMtx;
+static std::thread             g_spotDlThread;
+static std::string             g_spotDlPlaylistName;
+static std::atomic<bool>       g_spotDlRunning{false};
+
+// ── SPOTIFY API CALLS ─────────────────────────────────────────────────────────
+bool spotExchangeCode(const std::string& code){
+    std::string body="grant_type=authorization_code"
+                     "&code="+urlEncode(code)+
+                     "&redirect_uri="+urlEncode("http://127.0.0.1:8888/callback");
+    std::string auth="Authorization: Basic "+
+                     base64(g_spotClientId+":"+g_spotClientSecret);
+    std::string resp=httpsPost("accounts.spotify.com","/api/token",
+                               body,"application/x-www-form-urlencoded",auth);
+    g_spotAccessToken=jsonField(resp,"access_token");
+    return !g_spotAccessToken.empty();
+}
+
+// Fetch user's playlists (first 50)
+bool spotFetchPlaylists(){
+    std::string auth="Authorization: Bearer "+g_spotAccessToken;
+    std::string resp=httpsGet("api.spotify.com",
+                              "/v1/me/playlists?limit=50",auth);
+    // Write response to debug file so we can see what went wrong
+    {
+        std::ofstream dbg(getExeDir()+"spotify_debug.txt");
+        dbg<<"ACCESS TOKEN: "<<g_spotAccessToken<<"\n\n";
+        dbg<<"RESPONSE:\n"<<resp<<"\n";
+    }
+    if(resp.empty()) return false;
+    g_spotPlaylists.clear();
+    // Parse items array — find each "id" and "name" pair
+    // We scan for "items":[...] and iterate through objects
+    size_t itemsPos=resp.find("\"items\"");
+    if(itemsPos==std::string::npos) return false;
+    size_t pos=itemsPos;
+    while(true){
+        size_t idPos=resp.find("\"id\"",pos);
+        size_t namePos=resp.find("\"name\"",pos);
+        size_t totalPos=resp.find("\"total\"",pos);
+        if(idPos==std::string::npos||namePos==std::string::npos) break;
+        // Make sure we're inside items array (before "next" key)
+        size_t nextPos=resp.find("\"next\"",pos);
+        if(nextPos!=std::string::npos&&idPos>nextPos) break;
+        SpotPlaylistInfo pl;
+        // Extract id
+        size_t p=idPos+5;
+        while(p<resp.size()&&(resp[p]==' '||resp[p]==':'))++p;
+        if(resp[p]=='"'){++p;while(p<resp.size()&&resp[p]!='"')pl.id+=resp[p++];}
+        // Extract name
+        p=namePos+7;
+        while(p<resp.size()&&(resp[p]==' '||resp[p]==':'))++p;
+        if(resp[p]=='"'){++p;while(p<resp.size()&&resp[p]!='"'){
+            if(resp[p]=='\\'&&p+1<resp.size()){++p;}
+            pl.name+=resp[p++];
+        }}
+        // Extract total tracks
+        if(totalPos!=std::string::npos&&totalPos<(idPos+2000)){
+            p=totalPos+8;
+            while(p<resp.size()&&(resp[p]==' '||resp[p]==':'))++p;
+            std::string tot;
+            while(p<resp.size()&&isdigit(resp[p]))tot+=resp[p++];
+            if(!tot.empty())pl.total=std::stoi(tot);
+        }
+        if(!pl.id.empty()&&!pl.name.empty())
+            g_spotPlaylists.push_back(pl);
+        pos=std::max(idPos,namePos)+1;
+    }
+    return !g_spotPlaylists.empty();
+}
+
+// Fetch all tracks from a playlist
+bool spotFetchTracks(const std::string& playlistId, int total){
+    g_spotTracks.clear();
+    std::string auth="Authorization: Bearer "+g_spotAccessToken;
+    int offset=0;
+    while(offset<total){
+        std::string path="/v1/playlists/"+playlistId+
+                         "/tracks?limit=100&offset="+std::to_string(offset)+
+                         "&fields=items(track(name,artists(name)))";
+        std::string resp=httpsGet("api.spotify.com",path,auth);
+        if(resp.empty()) break;
+
+        // JSON structure per track (artists comes BEFORE name):
+        // {"track":{"artists":[{"name":"ARTIST"}],"name":"TITLE"}}
+        size_t pos=0;
+        while(true){
+            size_t trackPos=resp.find("\"track\":",pos);
+            if(trackPos==std::string::npos) break;
+            pos=trackPos+8;
+
+            // Find the artists array for this track
+            size_t artistsPos=resp.find("\"artists\":",pos);
+            // Find the track name (comes AFTER artists in this JSON)
+            size_t namePos=resp.find("\"name\":",pos);
+
+            if(artistsPos==std::string::npos||namePos==std::string::npos) continue;
+
+            // Extract first artist from inside [...] 
+            std::string artist;
+            size_t arrOpen=resp.find('[',artistsPos);
+            size_t arrClose=resp.find(']',arrOpen!=std::string::npos?arrOpen:artistsPos);
+            if(arrOpen!=std::string::npos){
+                size_t anPos=resp.find("\"name\":",arrOpen);
+                if(anPos!=std::string::npos&&
+                   (arrClose==std::string::npos||anPos<arrClose)){
+                    size_t ap=anPos+7;
+                    while(ap<resp.size()&&resp[ap]!='"') ++ap;
+                    if(ap<resp.size()){
+                        ++ap;
+                        while(ap<resp.size()&&resp[ap]!='"'){
+                            if(resp[ap]=='\\'&&ap+1<resp.size()){++ap;}
+                            artist+=resp[ap++];
+                        }
+                    }
+                }
+            }
+
+            // Track "name" comes after the closing ] of artists array
+            // Find the "name" field AFTER the artists array closes
+            size_t trackNamePos=resp.find("\"name\":",
+                arrClose!=std::string::npos?arrClose:artistsPos);
+            if(trackNamePos==std::string::npos) continue;
+
+            std::string title;
+            size_t tp=trackNamePos+7;
+            while(tp<resp.size()&&resp[tp]!='"') ++tp;
+            if(tp<resp.size()){
+                ++tp;
+                while(tp<resp.size()&&resp[tp]!='"'){
+                    if(resp[tp]=='\\'&&tp+1<resp.size()){++tp;}
+                    title+=resp[tp++];
+                }
+            }
+
+            if(!title.empty()){
+                SpotTrack tr;
+                tr.title=title;
+                tr.artist=artist;
+                tr.searchQuery=artist.empty()?title:artist+" - "+title;
+                tr.status="waiting";
+                g_spotTracks.push_back(tr);
+            }
+        }
+        offset+=100;
+    }
+    return !g_spotTracks.empty();
+}
+
+// ── YT-DLP DOWNLOAD THREAD ────────────────────────────────────────────────────
+void downloadThread(const std::string& outDir){
+    g_spotDlRunning=true;
+    int n=(int)g_spotTracks.size();
+    std::string ytdlp=getExeDir()+"yt-dlp.exe";
+    std::string ffmpeg=getExeDir()+"ffmpeg.exe";
+
+    for(int i=0;i<n;++i){
+        g_spotDlIdx=i;
+        {
+            std::lock_guard<std::mutex> lk(g_spotTrackMtx);
+            g_spotTracks[i].status="downloading";
+        }
+        std::string safeQuery=g_spotTracks[i].searchQuery;
+        std::string escaped;
+        for(char c:safeQuery){if(c=='"')escaped+="\\\"";else escaped+=c;}
+        std::string outTemplate=outDir+"\\%(title)s.%(ext)s";
+        // Build command — use CreateProcess with CREATE_NO_WINDOW to suppress console popup
+        std::string cmdLine="\""+ytdlp+"\" \"ytsearch1:"+escaped+"\" "
+                            "-x --audio-format mp3 --audio-quality 0 "
+                            "--no-playlist --quiet "
+                            "--ffmpeg-location \""+ffmpeg+"\" "
+                            "-o \""+outTemplate+"\"";
+        int ret=-1;
+        {
+            STARTUPINFOA si={};si.cb=sizeof(si);
+            PROCESS_INFORMATION pi={};
+            si.dwFlags=STARTF_USESTDHANDLES;
+            // Redirect stdout/stderr to NUL to suppress output
+            SECURITY_ATTRIBUTES sa={sizeof(SECURITY_ATTRIBUTES),nullptr,TRUE};
+            HANDLE nul=CreateFileA("NUL",GENERIC_WRITE,FILE_SHARE_WRITE,&sa,
+                                   OPEN_EXISTING,0,nullptr);
+            si.hStdOutput=nul; si.hStdError=nul; si.hStdInput=nullptr;
+            std::vector<char> cmdBuf(cmdLine.begin(),cmdLine.end());cmdBuf.push_back(0);
+            if(CreateProcessA(nullptr,cmdBuf.data(),nullptr,nullptr,TRUE,
+                              CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi)){
+                WaitForSingleObject(pi.hProcess,INFINITE);
+                DWORD exitCode=1;
+                GetExitCodeProcess(pi.hProcess,&exitCode);
+                ret=(int)exitCode;
+                CloseHandle(pi.hProcess);CloseHandle(pi.hThread);
+            }
+            if(nul!=INVALID_HANDLE_VALUE) CloseHandle(nul);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_spotTrackMtx);
+            g_spotTracks[i].status=(ret==0)?"done":"failed";
+        }
+    }
+
+    // All downloads done — scan folder and push results to main thread via event
+    // We store the found paths in a shared vector then signal the main thread
+    {
+        std::lock_guard<std::mutex> lk(g_spotTrackMtx);
+        // Reuse the filePath field of each track to store found mp3 paths
+        // We'll just signal main thread to do the scan itself
+    }
+
+    g_spotDlRunning=false;
+    g_spotDlIdx=n;
+
+    // Signal main thread to do the library import (code=2)
+    SDL_Event e; e.type=SDL_USEREVENT; e.user.code=2;
+    // Pass outDir as a heap string via data1
+    e.user.data1=new std::string(outDir);
+    SDL_PushEvent(&e);
+}
+
+// ── SPOTIFY UI DRAW ───────────────────────────────────────────────────────────
+void drawSpotifyUI(SDL_Renderer* r, int ww, int wh, Uint8 alpha, float buildT, float t){
+    if(g_spotState==SpotState::Idle) return;
+    // Each state uses its own build timer so fast transitions don't kill animations
+    float bp;
+    if(g_spotState==SpotState::WaitingAuth||g_spotState==SpotState::FetchingPlaylists)
+        bp=clamp01(g_spotWaitBuildT);
+    else
+        bp=clamp01(buildT);
+    float hue=fmod(t*22.f+120.f,360.f);
+
+    // Full screen dim
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r,0,0,0,(Uint8)(smoothstep(clamp01(bp*3.f))*160.f));
+    SDL_RenderFillRect(r,nullptr);
+
+    // ── CREDENTIALS DIALOG ───────────────────────────────────────────────────
+    if(g_spotState==SpotState::CredentialsDialog){
+        // Left panel: input form
+        int fx=ww/2-540,fy=wh/2-160,fw=380,fh=320;
+        // Right panel: instructions
+        int ix=ww/2-140,iy=wh/2-160,iw=420,ih=320;
+
+        // Clamp to screen
+        if(fx<10){int shift=10-fx;fx+=shift;ix+=shift;}
+
+        // ── FORM PANEL ───────────────────────────────────────────────────────
+        float scanP=clamp01((bp-0.10f)/0.45f);
+        float revH=scanP*fh;
+        if(revH>0.f){
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,3,8,6,(Uint8)(alpha*0.97f));
+            SDL_Rect bg={fx,fy,fw,(int)revH};SDL_RenderFillRect(r,&bg);
+        }
+        drawScanSweep(r,fx,fy,fw,fh,scanP,t,hue);
+        SDL_Color bc=hsv(hue,0.9f,1.f);bc.a=(Uint8)(alpha*0.95f);
+        drawBuildingBorder(r,fx,fy,fw,fh,smoothstep(clamp01((bp-0.05f)/0.40f)),t,bc);
+
+        if(bp>0.28f){
+            float f=smoothstep(clamp01((bp-0.28f)/0.22f));
+            float tp=clamp01((bp-0.28f)/0.20f);
+            std::string title=buildTypeOn("> SPOTIFY CONNECT",tp,t);
+            SDL_Color tg=hsv(hue,0.5f,1.f);tg.a=(Uint8)(alpha*f*0.35f);
+            for(int g2=0;g2<3;++g2) drawText(r,g_font,title,fx+14+g2,fy+10,tg,false);
+            drawText(r,g_font,title,fx+14,fy+10,{140,255,160,(Uint8)(alpha*f)});
+
+            // Thin separator under title
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color sep=hsv(hue,0.7f,1.f);sep.a=(Uint8)(alpha*f*0.5f);
+            SDL_SetRenderDrawColor(r,sep.r,sep.g,sep.b,sep.a);
+            SDL_Rect sepR={fx+10,fy+28,fw-20,1};SDL_RenderFillRect(r,&sepR);
+        }
+        // CLIENT ID field
+        if(bp>0.44f){
+            float f=smoothstep(clamp01((bp-0.44f)/0.20f));
+            drawText(r,g_fontSm,"CLIENT ID",fx+14,fy+42,{100,200,120,(Uint8)(alpha*f)});
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,8,18,12,(Uint8)(200*f));
+            SDL_Rect inp={fx+12,fy+58,fw-24,30};SDL_RenderFillRect(r,&inp);
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color fc=hsv(hue+(g_spotFocusId?0.f:50.f),0.9f,1.f);
+            fc.a=(Uint8)(255*f*(g_spotFocusId?1.f:0.35f));
+            for(int g2=0;g2<3;++g2){
+                SDL_SetRenderDrawColor(r,fc.r,fc.g,fc.b,(Uint8)(fc.a*(1.f-g2*0.3f)));
+                SDL_Rect inpG={fx+12-g2,fy+58-g2,fw-24+g2*2,30+g2*2};
+                SDL_RenderDrawRect(r,&inpG);
+            }
+            std::string idDisp=std::string(g_spotIdBuf);
+            if(g_spotFocusId&&fmod(t,1.f)<0.55f) idDisp+="_";
+            drawText(r,g_fontSm,idDisp,fx+18,fy+64,{180,255,180,(Uint8)(alpha*f)});
+        }
+        // CLIENT SECRET field
+        if(bp>0.56f){
+            float f=smoothstep(clamp01((bp-0.56f)/0.20f));
+            drawText(r,g_fontSm,"CLIENT SECRET",fx+14,fy+106,{100,200,120,(Uint8)(alpha*f)});
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,8,18,12,(Uint8)(200*f));
+            SDL_Rect inp={fx+12,fy+122,fw-24,30};SDL_RenderFillRect(r,&inp);
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color fc=hsv(hue+(!g_spotFocusId?0.f:50.f),0.9f,1.f);
+            fc.a=(Uint8)(255*f*(!g_spotFocusId?1.f:0.35f));
+            for(int g2=0;g2<3;++g2){
+                SDL_SetRenderDrawColor(r,fc.r,fc.g,fc.b,(Uint8)(fc.a*(1.f-g2*0.3f)));
+                SDL_Rect inpG={fx+12-g2,fy+122-g2,fw-24+g2*2,30+g2*2};
+                SDL_RenderDrawRect(r,&inpG);
+            }
+            std::string secDisp(strlen(g_spotSecretBuf),'*');
+            if(!g_spotFocusId&&fmod(t,1.f)<0.55f) secDisp+="_";
+            drawText(r,g_fontSm,secDisp,fx+18,fy+128,{180,255,180,(Uint8)(alpha*f)});
+        }
+        // Redirect URI reminder + controls
+        if(bp>0.70f){
+            float f=smoothstep(clamp01((bp-0.70f)/0.18f));
+            // Redirect URI box (read-only, user needs to add this to Spotify app)
+            drawText(r,g_fontSm,"REDIRECT URI  (add this to your Spotify app)",
+                     fx+14,fy+172,{80,160,90,(Uint8)(alpha*f*0.9f)});
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,6,14,10,(Uint8)(160*f));
+            SDL_Rect uriBox={fx+12,fy+188,fw-24,24};SDL_RenderFillRect(r,&uriBox);
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color uc=hsv(hue+30.f,0.6f,0.8f);uc.a=(Uint8)(180*f);
+            SDL_SetRenderDrawColor(r,uc.r,uc.g,uc.b,uc.a);
+            SDL_RenderDrawRect(r,&uriBox);
+            drawText(r,g_fontSm,"http://127.0.0.1:8888/callback",
+                     fx+16,fy+193,{120,220,140,(Uint8)(alpha*f)});
+        }
+        if(bp>0.82f){
+            float f=smoothstep(clamp01((bp-0.82f)/0.15f));
+            drawText(r,g_fontSm,"[TAB] switch   [ENTER] connect   [ESC] cancel",
+                     fx+14,fy+228,{70,130,80,(Uint8)(150*f)});
+            // Premium warning
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color warnC=hsv(30.f,1.f,1.f); warnC.a=(Uint8)(200*f);
+            drawText(r,g_fontSm,"! Spotify Premium required (thanks, greedy devs)",
+                     fx+14,fy+248,warnC);
+            if(!g_spotStatusMsg.empty())
+                drawText(r,g_fontSm,g_spotStatusMsg,
+                         fx+14,fy+265,{255,100,100,(Uint8)(220*f)});
+        }
+
+        // ── INSTRUCTIONS PANEL ────────────────────────────────────────────────
+        float scanP2=clamp01((bp-0.20f)/0.45f);
+        float revH2=scanP2*ih;
+        if(revH2>0.f){
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,4,6,14,(Uint8)(alpha*0.97f));
+            SDL_Rect bg2={ix,iy,iw,(int)revH2};SDL_RenderFillRect(r,&bg2);
+        }
+        drawScanSweep(r,ix,iy,iw,ih,scanP2,t,fmod(hue+60.f,360.f));
+        SDL_Color bc2=hsv(fmod(hue+60.f,360.f),0.85f,1.f);bc2.a=(Uint8)(alpha*0.85f);
+        drawBuildingBorder(r,ix,iy,iw,ih,smoothstep(clamp01((bp-0.15f)/0.40f)),t,bc2);
+
+        if(bp>0.35f){
+            float f=smoothstep(clamp01((bp-0.35f)/0.22f));
+            drawText(r,g_font,"HOW TO GET CREDENTIALS",
+                     ix+14,iy+10,{160,180,255,(Uint8)(alpha*f)});
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color sep2=hsv(fmod(hue+60.f,360.f),0.7f,1.f);sep2.a=(Uint8)(alpha*f*0.5f);
+            SDL_SetRenderDrawColor(r,sep2.r,sep2.g,sep2.b,sep2.a);
+            SDL_Rect sepR2={ix+10,iy+28,iw-20,1};SDL_RenderFillRect(r,&sepR2);
+        }
+
+        // Step-by-step instructions — stagger in one by one
+        struct Step{ float startT; const char* num; const char* text; };
+        static const Step steps[]={
+            {0.42f, "1.", "Go to  developer.spotify.com"},
+            {0.50f, "2.", "Log in and click  'Create App'"},
+            {0.57f, "3.", "Name it anything  (e.g. AcidKaleido)"},
+            {0.63f, "4.", "Set Redirect URI:"},
+            {0.63f, "  ", "  127.0.0.1:8888/callback"},
+            {0.70f, "5.", "Open app Settings -> copy"},
+            {0.70f, "  ", "  Client ID  and  Client Secret"},
+            {0.77f, "6.", "Paste them into the fields on the left"},
+            {0.84f, "7.", "Press ENTER to connect"},
+            {0.88f, "!", "Spotify Premium required to use the API"},
+            {0.88f, " ", "(yes really. their rules, not ours)"},
+        };
+        int nSteps=sizeof(steps)/sizeof(steps[0]);
+        for(int si=0;si<nSteps;++si){
+            if(bp<=steps[si].startT) continue;
+            float sf=smoothstep(clamp01((bp-steps[si].startT)/0.12f));
+            int sy=iy+40+si*26;
+            // Slide in from right
+            int slideX=(int)(ix+14+(1.f-sf)*40.f);
+            Uint8 sa=(Uint8)(alpha*sf);
+            // Warning lines render in orange
+            bool isWarning=(steps[si].num[0]=='!'||steps[si].num[0]==' '&&si>=9);
+            SDL_Color nc=isWarning?
+                hsv(30.f,1.f,1.f):
+                hsv(fmod(hue+60.f+si*15.f,360.f),0.9f,1.f);
+            nc.a=sa;
+            SDL_Color tc=isWarning?
+                SDL_Color{255,180,80,sa}:
+                SDL_Color{200,210,240,sa};
+            drawText(r,g_fontSm,steps[si].num,slideX,sy,nc);
+            drawText(r,g_fontSm,steps[si].text,slideX+22,sy,tc);
+        }
+    }
+
+    // ── WAITING FOR AUTH / FETCHING ──────────────────────────────────────────
+    if(g_spotState==SpotState::WaitingAuth||g_spotState==SpotState::FetchingPlaylists){
+        int ox=ww/2-280,oy=wh/2-120,ow=560,oh=240;
+        if(ox<10) ox=10;
+
+        // Background + scanline build-in
+        float scanP=clamp01(bp/0.45f);
+        float revH=scanP*oh;
+        if(revH>0.f){
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,3,8,6,(Uint8)(alpha*0.97f));
+            SDL_Rect bg={ox,oy,ow,(int)revH};SDL_RenderFillRect(r,&bg);
+        }
+        drawScanSweep(r,ox,oy,ow,oh,scanP,t,hue);
+        SDL_Color bc=hsv(hue,0.9f,1.f);bc.a=(Uint8)(alpha*0.95f);
+        drawBuildingBorder(r,ox,oy,ow,oh,smoothstep(clamp01(bp/0.38f)),t,bc);
+
+        // Corner sparks during build
+        if(bp>0.05f&&bp<0.55f){
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            float sparkT=clamp01(bp/0.55f);
+            for(int corner=0;corner<4;++corner){
+                float cx2=(corner%2==0)?(float)ox:(float)(ox+ow);
+                float cy2=(corner<2)?(float)oy:(float)(oy+oh);
+                float sa2=sinf(sparkT*(float)M_PI)*180.f;
+                for(int sp=0;sp<5;++sp){
+                    float sa3=(float)sp/5.f*2*(float)M_PI+t*9.f+corner*1.57f;
+                    SDL_Color sc=hsv(fmod(hue+corner*90.f+sp*25.f,360.f),1.f,1.f);
+                    sc.a=(Uint8)(sa2*(1.f-(float)sp/5.f));
+                    softCircle(r,{cx2+cosf(sa3)*sp*4.f,cy2+sinf(sa3)*sp*4.f},
+                               2.f+sp*0.5f,sc,{sc.r,sc.g,sc.b,0},6);
+                }
+            }
+        }
+
+        if(bp>0.28f){
+            float f=smoothstep(clamp01((bp-0.28f)/0.22f));
+
+            // Title with glow
+            bool isFetching=g_spotState==SpotState::FetchingPlaylists;
+            std::string titleStr=isFetching?
+                "> ESTABLISHING CONNECTION...":"> AWAITING AUTHORIZATION...";
+            float tp=clamp01((bp-0.28f)/0.20f);
+            std::string title=buildTypeOn(titleStr,tp,t);
+            SDL_Color tg=hsv(hue,0.5f,1.f);tg.a=(Uint8)(alpha*f*0.35f);
+            for(int g2=0;g2<3;++g2) drawText(r,g_font,title,ox+16+g2,oy+12,tg,false);
+            drawText(r,g_font,title,ox+16,oy+12,{140,255,160,(Uint8)(alpha*f)});
+
+            // Separator
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color sep=hsv(hue,0.7f,1.f);sep.a=(Uint8)(alpha*f*0.4f);
+            SDL_SetRenderDrawColor(r,sep.r,sep.g,sep.b,sep.a);
+            SDL_Rect sepR={ox+10,oy+32,ow-20,1};SDL_RenderFillRect(r,&sepR);
+        }
+
+        // Status lines — type on one by one
+        if(bp>0.40f){
+            float f=smoothstep(clamp01((bp-0.40f)/0.20f));
+            bool isFetching=g_spotState==SpotState::FetchingPlaylists;
+
+            struct StatusLine{ float start; const char* text; };
+            const StatusLine authLines[]={
+                {0.40f,"  Initializing secure handshake..."},
+                {0.48f,"  Opening browser window..."},
+                {0.55f,"  Waiting for Spotify OAuth response..."},
+                {0.62f,"  Listening on port 8888..."},
+            };
+            const StatusLine fetchLines[]={
+                {0.40f,"  Token exchange complete"},
+                {0.47f,"  Authenticating with Spotify API..."},
+                {0.54f,"  Requesting playlist data..."},
+                {0.61f,"  Parsing response..."},
+            };
+            const StatusLine* lines=isFetching?fetchLines:authLines;
+            for(int li=0;li<4;++li){
+                if(bp<=lines[li].start) continue;
+                float lf=smoothstep(clamp01((bp-lines[li].start)/0.10f));
+                int ly=oy+42+li*18;
+                // Slide in from left
+                int lx=(int)(ox+16+(1.f-lf)*30.f);
+                // Color: done lines go dim green, active line is bright
+                bool isActive=(li==3&&bp<0.90f);
+                SDL_Color lc=isActive?
+                    hsv(hue,0.9f,1.f):
+                    SDL_Color{70,140,80,(Uint8)(alpha*lf*0.8f)};
+                lc.a=(Uint8)(alpha*lf*(isActive?1.f:0.7f));
+                // Add animated dots to active line
+                std::string txt=lines[li].text;
+                if(isActive){
+                    int dots=(int)(t*3.f)%4;
+                    // Strip existing dots and re-add
+                    while(!txt.empty()&&txt.back()=='.') txt.pop_back();
+                    for(int d=0;d<dots;d++) txt+='.';
+                }
+                drawText(r,g_fontSm,txt,lx,ly,lc);
+                // Checkmark for completed lines
+                if(!isActive&&lf>0.8f){
+                    SDL_Color ck=hsv(hue,0.8f,1.f);ck.a=(Uint8)(alpha*lf*0.9f);
+                    drawText(r,g_fontSm,"OK",ox+ow-36,ly,ck);
+                }
+            }
+        }
+
+        // ── FAKE LOADING BAR ─────────────────────────────────────────────────
+        if(bp>0.55f){
+            float f=smoothstep(clamp01((bp-0.55f)/0.20f));
+            int pbX=ox+16, pbY=oy+126, pbW=ow-32, pbH=10;
+
+            // Label
+            float fakeP=g_spotFakeLoadT; // 0→1 over 4s
+            int pct=(int)(fakeP*100.f);
+            // Stall at 94% until real auth comes through — looks legit
+            if(pct>94&&g_spotState==SpotState::WaitingAuth) pct=94;
+            std::string pctStr="CONNECTING...  "+std::to_string(pct)+"%";
+            if(g_spotState==SpotState::FetchingPlaylists) pctStr="FETCHING PLAYLISTS...  "+std::to_string(std::min(pct,99))+"%";
+            drawText(r,g_fontSm,pctStr,pbX,pbY-16,
+                     {100,200,120,(Uint8)(alpha*f)});
+
+            // Track background
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,10,25,14,(Uint8)(200*f));
+            SDL_Rect pbBg={pbX,pbY,pbW,pbH};SDL_RenderFillRect(r,&pbBg);
+
+            // Filled portion — hue-shifts as it fills
+            float fillW=fakeP*pbW;
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            // Draw in horizontal strips for a gradient effect
+            int strips=20;
+            for(int s=0;s<strips;++s){
+                float sf=(float)s/strips;
+                if(sf*pbW>fillW) break;
+                float sw=std::min(pbW/strips+1.f, fillW-sf*pbW);
+                SDL_Color sc=hsv(fmod(hue+sf*60.f+t*20.f,360.f),0.9f,1.f);
+                sc.a=(Uint8)(200*f);
+                SDL_SetRenderDrawColor(r,sc.r,sc.g,sc.b,sc.a);
+                SDL_Rect stripe={pbX+(int)(sf*pbW),pbY,(int)sw,pbH};
+                SDL_RenderFillRect(r,&stripe);
+            }
+
+            // Shimmer scan moving across the filled portion
+            if(fillW>4.f){
+                float shimmerX=fmod(t*0.4f,1.f)*fillW;
+                for(int g2=0;g2<6;++g2){
+                    float gf=(float)g2/6.f;
+                    SDL_Color gc={255,255,255,(Uint8)(f*(1.f-gf)*80.f)};
+                    SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+                    SDL_Rect shim={pbX+(int)(shimmerX-g2*3),pbY,3,pbH};
+                    SDL_RenderFillRect(r,&shim);
+                }
+            }
+
+            // Border
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,40,100,50,(Uint8)(160*f));
+            SDL_RenderDrawRect(r,&pbBg);
+
+            // Sub-label below bar
+            if(g_spotState==SpotState::WaitingAuth){
+                drawText(r,g_fontSm,"Browser should have opened — log in and authorize",
+                         pbX,pbY+16,{60,120,70,(Uint8)(alpha*f*0.8f)});
+            } else {
+                drawText(r,g_fontSm,"Retrieving your playlists from Spotify",
+                         pbX,pbY+16,{60,120,70,(Uint8)(alpha*f*0.8f)});
+            }
+        }
+
+        // Cancel hint
+        if(bp>0.70f){
+            float f=smoothstep(clamp01((bp-0.70f)/0.15f));
+            drawText(r,g_fontSm,"[ ESC ] cancel",
+                     ox+16,oy+oh-20,{50,100,60,(Uint8)(140*f)});
+        }
+    }
+
+    // ── PLAYLIST PICKER ──────────────────────────────────────────────────────
+    if(g_spotState==SpotState::PlaylistPicker){
+        int ox=10,oy=80,ow=360;
+        int ph=std::min((int)g_spotPlaylists.size(),VISIBLE_ROWS)*ROW_H+32;
+        float scanP=clamp01((bp-0.10f)/0.45f);
+        float revH=scanP*ph;
+        if(revH>0.f){
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,3,8,6,(Uint8)(alpha*0.97f));
+            SDL_Rect bg={ox,oy,ow,(int)revH};SDL_RenderFillRect(r,&bg);
+        }
+        drawScanSweep(r,ox,oy,ow,ph,scanP,t,hue);
+        SDL_Color bc=hsv(hue,0.9f,1.f);bc.a=(Uint8)(alpha*0.95f);
+        drawBuildingBorder(r,ox,oy,ow,ph,smoothstep(clamp01((bp-0.05f)/0.40f)),t,bc);
+        if(bp>0.25f){
+            float hf=smoothstep(clamp01((bp-0.25f)/0.20f));
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,10,30,18,(Uint8)(alpha*hf*0.97f));
+            SDL_Rect hdr={ox,oy,ow,28};SDL_RenderFillRect(r,&hdr);
+            float tp=clamp01((bp-0.25f)/0.25f);
+            std::string title=buildTypeOn("SELECT PLAYLIST TO IMPORT",tp,t);
+            SDL_Color tg=hsv(hue,0.5f,1.f);tg.a=(Uint8)(alpha*hf*0.35f);
+            for(int g2=0;g2<3;++g2) drawText(r,g_font,title,ox+8+g2,oy+6,tg,false);
+            drawText(r,g_font,title,ox+8,oy+6,{140,255,160,(Uint8)(alpha*hf)});
+        }
+        if(bp>0.45f){
+            int listY=oy+30;
+            int visEnd=std::min(g_spotPlScroll+VISIBLE_ROWS,(int)g_spotPlaylists.size());
+            for(int i=g_spotPlScroll;i<visEnd;++i){
+                float rowStart=0.45f+(i-g_spotPlScroll)*0.035f;
+                float rowP=clamp01((bp-rowStart)/0.35f);
+                int ry=listY+(i-g_spotPlScroll)*ROW_H;
+                std::string label=g_spotPlaylists[i].name+
+                                  "  ["+std::to_string(g_spotPlaylists[i].total)+" tracks]";
+                drawAnimatedRow(r,ox+4,ry,ow-8,label,false,i==g_spotPlHover,
+                                alpha,rowP,t,fmod(hue+(i*18.f),360.f));
+            }
+        }
+    }
+
+    // ── DOWNLOAD QUEUE ───────────────────────────────────────────────────────
+    if(g_spotState==SpotState::Downloading||g_spotState==SpotState::Done){
+        int ox=10,oy=80,ow=520;
+        int visRows=std::min((int)g_spotTracks.size(),VISIBLE_ROWS);
+        int rowH=ROW_H+10; // taller rows to fit progress bar
+        int ph=visRows*rowH+64;
+        float bgF=smoothstep(clamp01(bp*4.f));
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,3,6,4,(Uint8)(alpha*bgF*0.97f));
+        SDL_Rect bg={ox,oy,ow,ph};SDL_RenderFillRect(r,&bg);
+        SDL_Color bc=hsv(hue,0.9f,1.f);bc.a=(Uint8)(alpha*0.85f);
+        drawBuildingBorder(r,ox,oy,ow,ph,smoothstep(clamp01(bp/0.3f)),t,bc);
+
+        // Header
+        int done=0,fail=0,total=(int)g_spotTracks.size();
+        {
+            std::lock_guard<std::mutex> lk(g_spotTrackMtx);
+            for(auto& tr:g_spotTracks){
+                if(tr.status=="done")++done;
+                if(tr.status=="failed")++fail;
+            }
+        }
+        std::string hdr="DOWNLOADING  "+std::to_string(done)+"/"+
+                        std::to_string(total)+" tracks";
+        if(!g_spotDlRunning&&g_spotState==SpotState::Done)
+            hdr="IMPORT COMPLETE  "+std::to_string(done)+" ok  "+
+                std::to_string(fail)+" failed";
+        drawText(r,g_font,hdr,ox+10,oy+6,{140,255,160,alpha},false);
+
+        // Overall progress bar
+        float prog=(total>0)?(float)done/total:0.f;
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        SDL_SetRenderDrawColor(r,20,60,30,alpha);
+        SDL_Rect pbBg={ox+10,oy+26,ow-20,6};SDL_RenderFillRect(r,&pbBg);
+        SDL_Color pfc=hsv(hue,0.9f,1.f);pfc.a=alpha;
+        SDL_SetRenderDrawColor(r,pfc.r,pfc.g,pfc.b,pfc.a);
+        SDL_Rect pbFill={ox+10,oy+26,(int)((ow-20)*prog),6};SDL_RenderFillRect(r,&pbFill);
+
+        // Track list
+        int dlIdx=g_spotDlIdx.load();
+        int scrollTo=std::max(0,dlIdx-2);
+        int listY=oy+40;
+        int visEnd=std::min(scrollTo+visRows,(int)g_spotTracks.size());
+        for(int i=scrollTo;i<visEnd;++i){
+            int ry=listY+(i-scrollTo)*rowH;
+            std::string status,label;
+            {
+                std::lock_guard<std::mutex> lk(g_spotTrackMtx);
+                status=g_spotTracks[i].status;
+                label=g_spotTracks[i].searchQuery;
+            }
+            bool isActive=(status=="downloading");
+            bool isDone  =(status=="done");
+            bool isFailed=(status=="failed");
+
+            // Row background
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_Color bg2={8,16,10,(Uint8)(alpha*(isActive?0.6f:0.3f))};
+            SDL_SetRenderDrawColor(r,bg2.r,bg2.g,bg2.b,bg2.a);
+            SDL_Rect row={ox+4,ry,ow-8,rowH-2};SDL_RenderFillRect(r,&row);
+
+            // ── PER-TRACK PROGRESS BAR ────────────────────────────────────────
+            int barX=ox+8, barY=ry+rowH-10, barW=ow-16, barH=4;
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,12,30,16,(Uint8)(alpha*0.8f));
+            SDL_Rect barBg={barX,barY,barW,barH};SDL_RenderFillRect(r,&barBg);
+
+            float trackProg=0.f;
+            SDL_Color barCol={0,0,0,0};
+            if(isDone){
+                trackProg=1.f;
+                barCol=hsv(hue,0.9f,1.f);barCol.a=(Uint8)(alpha*0.9f);
+            } else if(isFailed){
+                trackProg=1.f;
+                barCol={255,60,60,alpha};
+            } else if(isActive){
+                // Animated fake progress — crawls to 90% then stalls
+                // We use a sine-eased time so it looks organic
+                float elapsed=fmod(t,30.f)/30.f; // resets every 30s
+                trackProg=0.9f*(1.f-expf(-elapsed*4.f));
+                barCol=hsv(fmod(hue+t*20.f,360.f),0.9f,1.f);barCol.a=(Uint8)(alpha*0.9f);
+            } else if(status=="waiting"){
+                trackProg=0.f;
+                barCol={40,80,50,(Uint8)(alpha*0.5f)};
+            }
+
+            // Fill bar
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            if(trackProg>0.f){
+                // Gradient fill
+                int fillW=(int)(barW*trackProg);
+                int strips=std::max(1,fillW/4);
+                for(int s=0;s<strips;++s){
+                    float sf=(float)s/strips;
+                    SDL_Color sc=barCol;
+                    sc.a=(Uint8)(barCol.a*(0.6f+sf*0.4f));
+                    SDL_SetRenderDrawColor(r,sc.r,sc.g,sc.b,sc.a);
+                    SDL_Rect stripe={barX+(int)(sf*fillW),barY,fillW/strips+1,barH};
+                    SDL_RenderFillRect(r,&stripe);
+                }
+                // Shimmer on active track
+                if(isActive){
+                    float shim=fmod(t*0.8f,1.f)*(float)fillW;
+                    for(int g2=0;g2<4;++g2){
+                        SDL_Color gc={255,255,255,(Uint8)(alpha*(1.f-g2*0.25f)*0.4f)};
+                        SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+                        SDL_Rect shimR={barX+(int)(shim)-g2*2,barY,3,barH};
+                        SDL_RenderFillRect(r,&shimR);
+                    }
+                }
+            }
+
+            // Status icon + label
+            std::string icon="  ";
+            SDL_Color tc={120,140,130,alpha};
+            if(isActive){
+                const char* spin[]={"/ ","- ","\\ ","| "};
+                icon=spin[(int)(t*6.f)%4];
+                tc={140,255,160,alpha};
+            } else if(isDone){
+                icon="OK"; tc={80,220,100,alpha};
+            } else if(isFailed){
+                icon="XX"; tc={255,80,80,alpha};
+            } else {
+                icon=".."; tc={60,80,70,alpha};
+            }
+            drawText(r,g_fontSm,icon+" "+label,ox+10,ry+4,tc);
+        }
+        if(g_spotState==SpotState::Done)
+            drawText(r,g_fontSm,"[ ESC ] close",ox+10,oy+ph-18,
+                     {60,120,70,alpha});
+    }
+}
+
+// ── SPOTIFY ACTIONS CALLED FROM EVENT LOOP ───────────────────────────────────
+void spotOpenCredentials(){
+    loadSpotifyConfig();
+    strncpy(g_spotIdBuf,g_spotClientId.c_str(),sizeof(g_spotIdBuf)-1);
+    strncpy(g_spotSecretBuf,g_spotClientSecret.c_str(),sizeof(g_spotSecretBuf)-1);
+    g_spotStatusMsg="";
+    g_spotFocusId=true;
+    g_spotState=SpotState::CredentialsDialog;
+    g_spotBuildT=0.f; g_spotBuilding=true;
+    SDL_StartTextInput();
+}
+
+void spotStartAuth(){
+    g_spotClientId=std::string(g_spotIdBuf);
+    g_spotClientSecret=std::string(g_spotSecretBuf);
+    if(g_spotClientId.empty()||g_spotClientSecret.empty()){
+        g_spotStatusMsg="ERROR: Both fields required"; return;
+    }
+    saveSpotifyConfig();
+    // Start local OAuth capture server
+    g_spotCodeReady=false;
+    g_spotAuthCode="";
+    g_spotAccessToken="";
+    std::thread(oauthServerThread).detach();
+    // Open browser
+    std::string url="https://accounts.spotify.com/authorize?"
+        "client_id="+g_spotClientId+
+        "&response_type=code"
+        "&redirect_uri="+urlEncode("http://127.0.0.1:8888/callback")+
+        "&scope="+urlEncode("playlist-read-private playlist-read-collaborative");
+    ShellExecuteA(nullptr,"open",url.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+    g_spotState=SpotState::WaitingAuth;
+    g_spotBuildT=0.f; g_spotBuilding=true;
+    g_spotWaitBuildT=0.f;
+    g_spotFakeLoadT=0.f; g_spotFakeLoading=false;
+    SDL_StopTextInput();
+}
+
+void spotSelectPlaylist(int idx){
+    if(idx<0||idx>=(int)g_spotPlaylists.size()) return;
+    auto& pl=g_spotPlaylists[idx];
+    g_spotStatusMsg="Fetching tracks...";
+    g_spotDlPlaylistName=pl.name;
+    // Build clean folder name
+    std::string cleanName;
+    for(unsigned char c:pl.name){
+        if(c>=32&&c<128&&c!='/'&&c!='*'&&c!='?'&&c!='"'&&
+           c!='<'&&c!='>'&&c!='|'&&c!=':') cleanName+=c;
+    }
+    if(cleanName.empty()||cleanName.find_first_not_of(' ')==std::string::npos)
+        cleanName="Spotify_Playlist";
+    while(!cleanName.empty()&&cleanName.back()==' ') cleanName.pop_back();
+    std::string outDir=getExeDir()+"downloads\\"+cleanName;
+    std::filesystem::create_directories(outDir);
+    // Move to downloading state immediately — fetch + download on background thread
+    g_spotState=SpotState::Downloading;
+    g_spotBuildT=0.f; g_spotBuilding=true;
+    g_spotDlIdx=0;
+    g_spotDlRunning=true;
+    std::string plId=pl.id; int plTotal=pl.total;
+    if(g_spotDlThread.joinable()) g_spotDlThread.join();
+    g_spotDlThread=std::thread([plId,plTotal,outDir](){
+        // Fetch tracks first, then download
+        spotFetchTracks(plId,plTotal);
+        if(g_spotTracks.empty()){
+            g_spotStatusMsg="ERROR: No tracks found";
+            g_spotDlRunning=false;
+            g_spotDlIdx=0;
+            return;
+        }
+        downloadThread(outDir);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
+int main(int argc,char** argv){
+    g_exeDir=getExeDir(); // must be first so logErr works
+    if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO)<0){std::cerr<<"SDL_Init failed\n";return 1;}
+    TTF_Init();
+    initFonts();
+    SDL_Window* win=SDL_CreateWindow(
+        "ACID KALEIDO  |  Click top-left button for menu  |  Esc=Quit",
+        SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
+        1280,720,SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
+    SDL_Renderer* ren=SDL_CreateRenderer(win,-1,
+        SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+
+    // Init SDL_mixer with all supported formats
+    int mixFlags=MIX_INIT_MP3|MIX_INIT_OGG|MIX_INIT_FLAC|MIX_INIT_MOD;
+    int mixInited=Mix_Init(mixFlags);
+    // Log what actually got inited
+    {
+        std::ofstream f(getExeDir()+"audio_debug.txt");
+        f<<"Mix_Init requested: "<<mixFlags<<"\n";
+        f<<"Mix_Init got:       "<<mixInited<<"\n";
+        f<<"MP3  supported: "<<((mixInited&MIX_INIT_MP3) ?"YES":"NO")<<"\n";
+        f<<"OGG  supported: "<<((mixInited&MIX_INIT_OGG) ?"YES":"NO")<<"\n";
+        f<<"FLAC supported: "<<((mixInited&MIX_INIT_FLAC)?"YES":"NO")<<"\n";
+        if(!(mixInited&MIX_INIT_MP3))
+            f<<"MP3 error: "<<Mix_GetError()<<"\n";
+    }
+    if(Mix_OpenAudio(44100,AUDIO_F32SYS,2,1024)<0){
+        std::ofstream f(getExeDir()+"audio_debug.txt",std::ios::app);
+        f<<"Mix_OpenAudio failed: "<<Mix_GetError()<<"\n";
+        return 1;
+    }
+    Mix_AllocateChannels(2);g_pcmMutex=SDL_CreateMutex();
+    Mix_SetPostMix(audioCaptureCallback,nullptr);
+    loadLibrary();
+    Mix_HookMusicFinished([](){
+        SDL_Event e; e.type=SDL_USEREVENT; e.user.code=1;
+        SDL_PushEvent(&e);
+    });
+
+    std::vector<double> fftIn(FFT_N,0.0);
+    fftw_complex* fftOut=fftw_alloc_complex(FREQ_BINS+1);
+    fftw_plan plan=fftw_plan_dft_r2c_1d(FFT_N,fftIn.data(),fftOut,FFTW_ESTIMATE);
+    std::vector<double> hannWin(FFT_N);
+    for(int i=0;i<FFT_N;++i)hannWin[i]=0.5*(1.0-cos(2.0*M_PI*i/(FFT_N-1)));
+    std::vector<float> spec(FREQ_BINS,0.f);
+
+    std::mt19937 rng(std::random_device{}());
+    int ww,wh;SDL_GetRendererOutputSize(ren,&ww,&wh);
+    float maxR=sqrtf((ww*.5f)*(ww*.5f)+(wh*.5f)*(wh*.5f));
+
+    initKNodes(maxR,rng);
+
+    auto makeT=[&]()->SDL_Texture*{
+        SDL_Texture* tx=SDL_CreateTexture(ren,SDL_PIXELFORMAT_RGBA8888,
+                                          SDL_TEXTUREACCESS_TARGET,ww,wh);
+        SDL_SetTextureBlendMode(tx,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderTarget(ren,tx);SDL_SetRenderDrawColor(ren,0,0,0,255);
+        SDL_RenderClear(ren);SDL_SetRenderTarget(ren,nullptr);return tx;
+    };
+    SDL_Texture* fbA=makeT(),*fbB=makeT();
+    SDL_Texture* layerTex=makeT();
+
+    if(argc>=2)loadAndPlay(argv[1]);
+
+    float t=0.f;bool running=true;
+    Uint32 lastTick=SDL_GetTicks();
+    float sBass=0,sMid=0,sHigh=0,sAll=0,sSub=0,sLM=0,sHM=0;
+    int frame=0;
+
+    while(running){
+        Uint32 now=SDL_GetTicks();
+        float dt=std::min((now-lastTick)/1000.f,0.033f);
+        lastTick=now;t+=dt;
+
+        SDL_GetRendererOutputSize(ren,&ww,&wh);
+
+        SDL_Event ev;
+        while(SDL_PollEvent(&ev)){
+            if(ev.type==SDL_QUIT)running=false;
+            if(ev.type==SDL_USEREVENT&&ev.user.code==1){
+                // Guard against rapid-fire: ignore if track just changed < 2s ago
+                if(SDL_GetTicks()-g_lastTrackChange > 2000)
+                    playNext();
+            }
+
+            // Download complete — import MP3s into library on main thread (thread safe)
+            if(ev.type==SDL_USEREVENT&&ev.user.code==2){
+                std::string* outDirPtr=static_cast<std::string*>(ev.user.data1);
+                if(outDirPtr){
+                    std::string outDir=*outDirPtr;
+                    delete outDirPtr;
+                    namespace fs=std::filesystem;
+                    Playlist newPL; newPL.name=g_spotDlPlaylistName;
+                    if(fs::exists(outDir)){
+                        std::error_code ec;
+                        for(auto& entry:fs::directory_iterator(outDir,ec)){
+                            if(ec){ec.clear();continue;}
+                            auto ext=entry.path().extension().string();
+                            std::string extLo=ext;
+                            for(auto& c:extLo) c=(char)tolower((unsigned char)c);
+                            if(extLo==".mp3"){
+                                std::string p=entry.path().string();
+                                addToLibrary(p);
+                                for(int i=0;i<(int)g_library.size();++i){
+                                    if(g_library[i].path==p){
+                                        bool already=false;
+                                        for(int idx:newPL.songIndices)
+                                            if(idx==i){already=true;break;}
+                                        if(!already) newPL.songIndices.push_back(i);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if(!newPL.songIndices.empty()){
+                        bool replaced=false;
+                        for(auto& pl:g_playlists){
+                            if(pl.name==newPL.name){pl=newPL;replaced=true;break;}
+                        }
+                        if(!replaced) g_playlists.push_back(newPL);
+                        saveLibrary();
+                    }
+                }
+            }
+
+            if(ev.type==SDL_KEYDOWN){
+                if(g_namingPL){
+                    if(ev.key.keysym.sym==SDLK_RETURN){
+                        if(strlen(g_newPLName)>0){
+                            Playlist pl; pl.name=std::string(g_newPLName);
+                            g_playlists.push_back(pl); saveLibrary();
+                        }
+                        g_namingPL=false; SDL_StopTextInput();
+                    } else if(ev.key.keysym.sym==SDLK_ESCAPE){
+                        g_namingPL=false; SDL_StopTextInput();
+                    } else if(ev.key.keysym.sym==SDLK_BACKSPACE){
+                        int l=strlen(g_newPLName);
+                        if(l>0)g_newPLName[l-1]=0;
+                    } else if(ev.key.keysym.sym==SDLK_v &&
+                              (ev.key.keysym.mod & KMOD_CTRL)){
+                        if(SDL_HasClipboardText()){
+                            char* clip=SDL_GetClipboardText();
+                            if(clip){
+                                std::string pasted;
+                                for(char c:std::string(clip))
+                                    if(c!='\n'&&c!='\r'&&c!='\t') pasted+=c;
+                                SDL_free(clip);
+                                int l=strlen(g_newPLName);
+                                strncat(g_newPLName,pasted.c_str(),
+                                        std::max(0,(int)(sizeof(g_newPLName)-l-1)));
+                            }
+                        }
+                    }
+                } else if(g_spotState==SpotState::CredentialsDialog){
+                    if(ev.key.keysym.sym==SDLK_RETURN){ spotStartAuth(); }
+                    else if(ev.key.keysym.sym==SDLK_ESCAPE){
+                        g_spotState=SpotState::Idle; SDL_StopTextInput();
+                    } else if(ev.key.keysym.sym==SDLK_TAB){
+                        g_spotFocusId=!g_spotFocusId;
+                    } else if(ev.key.keysym.sym==SDLK_BACKSPACE){
+                        if(g_spotFocusId){ int l=strlen(g_spotIdBuf);     if(l>0)g_spotIdBuf[l-1]=0; }
+                        else             { int l=strlen(g_spotSecretBuf); if(l>0)g_spotSecretBuf[l-1]=0; }
+                    } else if(ev.key.keysym.sym==SDLK_v &&
+                              (ev.key.keysym.mod & KMOD_CTRL)){
+                        // Ctrl+V — paste from clipboard
+                        if(SDL_HasClipboardText()){
+                            char* clip=SDL_GetClipboardText();
+                            if(clip){
+                                // Strip newlines/tabs from pasted text
+                                std::string pasted;
+                                for(char c:std::string(clip))
+                                    if(c!='\n'&&c!='\r'&&c!='\t') pasted+=c;
+                                SDL_free(clip);
+                                if(g_spotFocusId){
+                                    int l=strlen(g_spotIdBuf);
+                                    strncat(g_spotIdBuf,pasted.c_str(),
+                                            std::max(0,(int)(sizeof(g_spotIdBuf)-l-1)));
+                                } else {
+                                    int l=strlen(g_spotSecretBuf);
+                                    strncat(g_spotSecretBuf,pasted.c_str(),
+                                            std::max(0,(int)(sizeof(g_spotSecretBuf)-l-1)));
+                                }
+                            }
+                        }
+                    } else if(ev.key.keysym.sym==SDLK_a &&
+                              (ev.key.keysym.mod & KMOD_CTRL)){
+                        // Ctrl+A — clear the active field
+                        if(g_spotFocusId) memset(g_spotIdBuf,0,sizeof(g_spotIdBuf));
+                        else              memset(g_spotSecretBuf,0,sizeof(g_spotSecretBuf));
+                    }
+                } else if(g_spotState==SpotState::WaitingAuth){
+                    if(ev.key.keysym.sym==SDLK_ESCAPE) g_spotState=SpotState::Idle;
+                } else if(g_spotState==SpotState::PlaylistPicker){
+                    if(ev.key.keysym.sym==SDLK_ESCAPE) g_spotState=SpotState::Idle;
+                } else if(g_spotState==SpotState::Done){
+                    if(ev.key.keysym.sym==SDLK_ESCAPE) g_spotState=SpotState::Idle;
+                } else {
+                    switch(ev.key.keysym.sym){
+                        case SDLK_ESCAPE:
+                            if(g_menuTarget){ toggleMenu(t); }
+                            else if(g_panel!=UIPanel::None){ g_panel=UIPanel::None; }
+                            else running=false;
+                            break;
+                        case SDLK_SPACE:
+                            if(g_music){g_paused=!g_paused;g_paused?Mix_PauseMusic():Mix_ResumeMusic();}
+                            break;
+                        case SDLK_RIGHT: playNext(); break;
+                        case SDLK_LEFT:  playPrev(); break;
+                        case SDLK_m:     toggleMenu(t); break;
+                        case SDLK_o:{
+                            std::string f=openFilePicker();
+                            if(!f.empty()){addToLibrary(f);g_currentSong=(int)g_library.size()-1;loadAndPlay(f);}
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if(ev.type==SDL_TEXTINPUT){
+                if(g_namingPL){
+                    int l=strlen(g_newPLName);
+                    if(l<120){ strncat(g_newPLName,ev.text.text,120-l); }
+                } else if(g_spotState==SpotState::CredentialsDialog){
+                    if(g_spotFocusId){
+                        int l=strlen(g_spotIdBuf);
+                        if(l<250) strncat(g_spotIdBuf,ev.text.text,250-l);
+                    } else {
+                        int l=strlen(g_spotSecretBuf);
+                        if(l<250) strncat(g_spotSecretBuf,ev.text.text,250-l);
+                    }
+                }
+            }
+
+            if(ev.type==SDL_MOUSEWHEEL){
+                if(g_panel==UIPanel::Library)
+                    g_libScroll=std::clamp(g_libScroll-ev.wheel.y,0,std::max(0,(int)g_library.size()-VISIBLE_ROWS));
+                if(g_panel==UIPanel::Playlists)
+                    g_plScroll=std::clamp(g_plScroll-ev.wheel.y,0,std::max(0,(int)g_playlists.size()-VISIBLE_ROWS+1));
+                if(g_spotState==SpotState::PlaylistPicker)
+                    g_spotPlScroll=std::clamp(g_spotPlScroll-ev.wheel.y,0,
+                        std::max(0,(int)g_spotPlaylists.size()-VISIBLE_ROWS));
+            }
+
+            if(ev.type==SDL_MOUSEMOTION){
+                int mx=ev.motion.x,my=ev.motion.y;
+                g_menuHover = menuHoverTest(mx, my, g_menuOpen);
+                g_hoverSong = libraryClickRow(mx,my);
+                // Spotify playlist hover
+                if(g_spotState==SpotState::PlaylistPicker){
+                    int ox=10,oy=80,ow=360,listY=oy+30;
+                    if(mx>=ox&&mx<=ox+ow){
+                        int row=(my-listY)/ROW_H;
+                        g_spotPlHover=(row>=0&&row<VISIBLE_ROWS&&
+                                       row+g_spotPlScroll<(int)g_spotPlaylists.size())?
+                                       row+g_spotPlScroll:-1;
+                    } else g_spotPlHover=-1;
+                }
+                g_idleTimer=0.f; g_uiVisible=true;
+            }
+
+            if(ev.type==SDL_MOUSEBUTTONDOWN&&ev.button.button==SDL_BUTTON_LEFT){
+                int mx=ev.button.x,my=ev.button.y;
+                g_idleTimer=0.f; g_uiVisible=true;
+
+                // Spotify playlist picker click
+                if(g_spotState==SpotState::PlaylistPicker){
+                    int ox=10,oy=80,ow=360,listY=oy+30;
+                    if(mx>=ox&&mx<=ox+ow&&my>=listY){
+                        int row=(my-listY)/ROW_H;
+                        int idx=row+g_spotPlScroll;
+                        if(row>=0&&row<VISIBLE_ROWS&&idx<(int)g_spotPlaylists.size())
+                            spotSelectPlaylist(idx);
+                    }
+                }
+
+                // Progress bar seek
+                if(onProgressBar(mx,my,ww,wh)&&g_music){
+                    double dur=Mix_MusicDuration(g_music);
+                    float frac=(float)(mx-80)/(ww-180);
+                    Mix_SetMusicPosition(dur*frac);
+                }
+
+                // Check menu trigger button
+                if(hitMenuBtn(mx,my)){
+                    toggleMenu(t);
+                }
+                // Check menu items (only when open)
+                else if(g_menuOpen > 0.3f){
+                    int hit = -1;
+                    for(int i=0;i<MENU_ITEM_COUNT;++i)
+                        if(hitMenuItem(mx,my,i,g_menuOpen)){ hit=i; break; }
+                    if(hit >= 0){
+                        // Close menu with flourish
+                        toggleMenu(t);
+                        switch(MENU_ITEMS[hit].action){
+                        case MenuAction::Library:
+                            if(g_panel!=UIPanel::Library){
+                                g_panel=UIPanel::Library;
+                                g_panelBuildT=0.f; g_panelBuilding=true;
+                            } else { g_panel=UIPanel::None; }
+                            break;
+                        case MenuAction::Playlists:
+                            if(g_panel!=UIPanel::Playlists){
+                                g_panel=UIPanel::Playlists;
+                                g_panelBuildT=0.f; g_panelBuilding=true;
+                            } else { g_panel=UIPanel::None; }
+                            break;
+                        case MenuAction::AddSong:{
+                            std::string f=openFilePicker();
+                            if(!f.empty()){addToLibrary(f);g_currentSong=(int)g_library.size()-1;loadAndPlay(f);}
+                            break;
+                        }
+                        case MenuAction::PlayPause:
+                            if(g_music){g_paused=!g_paused;g_paused?Mix_PauseMusic():Mix_ResumeMusic();}
+                            else if(!g_library.empty()) playLibrarySong(0);
+                            break;
+                        case MenuAction::Prev: playPrev(); break;
+                        case MenuAction::Next: playNext(); break;
+                        case MenuAction::NewPlaylist:
+                            memset(g_newPLName,0,sizeof(g_newPLName));
+                            strcpy(g_newPLName,"New Playlist");
+                            g_namingPL=true;
+                            g_namingBuildT=0.f; g_namingBuilding=true;
+                            SDL_StartTextInput();
+                            break;
+                        case MenuAction::Spotify:
+                            spotOpenCredentials();
+                            break;
+                        default: break;
+                    }
+                    }
+                }
+
+                // Panel row clicks
+                int songClicked=libraryClickRow(mx,my);
+                if(songClicked>=0){
+                    if(g_selectedPL>=0&&g_selectedPL<(int)g_playlists.size()){
+                        auto& pl=g_playlists[g_selectedPL];
+                        bool alreadyIn=false;
+                        for(int i:pl.songIndices)if(i==songClicked)alreadyIn=true;
+                        if(!alreadyIn){pl.songIndices.push_back(songClicked);saveLibrary();}
+                    }
+                    g_currentSong=songClicked;
+                    playLibrarySong(songClicked);
+                }
+                int plClicked=playlistClickRow(mx,my);
+                if(plClicked>=-1){
+                    if(plClicked==-1){
+                        g_currentPL=-1;g_selectedPL=-1;
+                        g_panel=UIPanel::Library;
+                    } else if(plClicked<(int)g_playlists.size()){
+                        g_currentPL=plClicked;g_selectedPL=plClicked;
+                        g_currentPLTrack=-1;
+                        if(!g_playlists[plClicked].songIndices.empty()){
+                            g_currentPLTrack=0;
+                            playLibrarySong(g_playlists[plClicked].songIndices[0]);
+                        }
+                    }
+                }
+            }
+
+            if(ev.type==SDL_DROPFILE){
+                std::string f(ev.drop.file);SDL_free(ev.drop.file);
+                addToLibrary(f);g_currentSong=(int)g_library.size()-1;loadAndPlay(f);
+            }
+            if(ev.type==SDL_WINDOWEVENT&&ev.window.event==SDL_WINDOWEVENT_SIZE_CHANGED){
+                SDL_GetRendererOutputSize(ren,&ww,&wh);
+                maxR=sqrtf((ww*.5f)*(ww*.5f)+(wh*.5f)*(wh*.5f));
+                SDL_DestroyTexture(fbA);SDL_DestroyTexture(fbB);SDL_DestroyTexture(layerTex);
+                fbA=makeT();fbB=makeT();layerTex=makeT();
+                initKNodes(maxR,rng);g_neuronsInit=false;g_rainInit=false;g_geoInit=false;
+            }
+        }
+
+        // Update menu animation
+        updateMenu(dt);
+        updateMenuRipples(dt);
+        MENU_BTN_X = ww * 0.5f; // keep centered as window resizes
+
+        // Advance fake loading bar — crawls to 94% over 4s then stalls waiting for real auth
+        if(g_spotState==SpotState::WaitingAuth||g_spotState==SpotState::FetchingPlaylists){
+            // Advance the waiting screen's own build timer
+            if(g_spotWaitBuildT < 1.f)
+                g_spotWaitBuildT = std::min(1.f, g_spotWaitBuildT + dt * 0.55f);
+            if(!g_spotFakeLoading){
+                g_spotFakeLoadT=0.f;
+                g_spotFakeLoading=true;
+            }
+            // Eased crawl — fast at start, slows near 94%, then holds
+            float target = g_spotState==SpotState::FetchingPlaylists ? 0.99f : 0.94f;
+            if(g_spotFakeLoadT < target){
+                // Non-linear speed: fast early, very slow near target
+                float gap = target - g_spotFakeLoadT;
+                float speed = gap * 0.7f + 0.02f; // proportional + tiny minimum
+                g_spotFakeLoadT += dt * speed * (1.f/4.f); // 4s to reach target
+                g_spotFakeLoadT = std::min(g_spotFakeLoadT, target);
+            }
+        } else {
+            g_spotFakeLoading=false;
+            g_spotFakeLoadT=0.f;
+        }
+
+        // Spotify state machine tick
+        if(g_spotState==SpotState::WaitingAuth&&g_spotCodeReady.load()){
+            // Grab and immediately clear the code so it can't be reused
+            std::string code;
+            {
+                std::lock_guard<std::mutex> lk(g_spotMtx);
+                code=g_spotAuthCode;
+                g_spotAuthCode="";
+            }
+            g_spotCodeReady=false;  // reset so next auth attempt works fresh
+            g_spotState=SpotState::FetchingPlaylists;
+            g_spotBuildT=0.f; g_spotBuilding=true;
+            g_spotWaitBuildT=0.f;
+            // Exchange code for token + fetch playlists on background thread
+            std::thread([code]{
+                if(!spotExchangeCode(code)){
+                    g_spotStatusMsg="ERROR: Token exchange failed. Check Client ID/Secret.";
+                    g_spotState=SpotState::CredentialsDialog;
+                    g_spotBuildT=0.f; g_spotBuilding=true;
+                    return;
+                }
+                if(!spotFetchPlaylists()){
+                    g_spotStatusMsg="ERROR: Could not fetch playlists. Try again.";
+                    g_spotState=SpotState::CredentialsDialog;
+                    g_spotBuildT=0.f; g_spotBuilding=true;
+                    return;
+                }
+                g_spotState=SpotState::PlaylistPicker;
+                g_spotBuildT=0.f; g_spotBuilding=true;
+            }).detach();
+        }
+        // Downloading → Done transition
+        if(g_spotState==SpotState::Downloading&&!g_spotDlRunning.load())
+            g_spotState=SpotState::Done;
+
+        // Advance Spotify build timer
+        if(g_spotBuilding){
+            g_spotBuildT+=dt*0.55f;
+            if(g_spotBuildT>=1.f){g_spotBuildT=1.f;g_spotBuilding=false;}
+        }
+
+        // Advance panel build timers
+        if(g_panelBuilding){
+            g_panelBuildT += dt * g_panelBuildSpd;
+            if(g_panelBuildT >= 1.f){ g_panelBuildT=1.f; g_panelBuilding=false; }
+        }
+        if(g_namingBuilding){
+            g_namingBuildT += dt * 2.8f;
+            if(g_namingBuildT >= 1.f){ g_namingBuildT=1.f; g_namingBuilding=false; }
+        }
+
+        // FFT
+        SDL_LockMutex(g_pcmMutex);
+        int base=(g_pcmWrite-FFT_N*2+FFT_N*200)%(FFT_N*2);
+        for(int i=0;i<FFT_N;++i){
+            float l=g_pcmBuf[(base+i*2)%(FFT_N*2)],r2=g_pcmBuf[(base+i*2+1)%(FFT_N*2)];
+            fftIn[i]=(l+r2)*.5*hannWin[i];
+        }
+        SDL_UnlockMutex(g_pcmMutex);
+        fftw_execute(plan);
+        for(int i=0;i<FREQ_BINS;++i){
+            double re=fftOut[i][0],im=fftOut[i][1];
+            float n=clamp01((20.f*log10f((float)(sqrt(re*re+im*im)/FFT_N)+1e-7f)+90.f)/90.f);
+            spec[i]=lerp(spec[i],n,.3f);
+        }
+        float rSub=0,rB=0,rLM=0,rM=0,rHM=0,rH=0;
+        for(int i=0; i<3;  ++i)rSub+=spec[i];rSub/=3.f;
+        for(int i=3; i<11; ++i)rB  +=spec[i];rB  /=8.f;
+        for(int i=11;i<24; ++i)rLM +=spec[i];rLM /=13.f;
+        for(int i=24;i<93; ++i)rM  +=spec[i];rM  /=69.f;
+        for(int i=93;i<180;++i)rHM +=spec[i];rHM /=87.f;
+        for(int i=180;i<280;++i)rH+=spec[i];rH/=100.f;
+        float rA=rSub*.1f+rB*.35f+rLM*.15f+rM*.25f+rHM*.1f+rH*.05f;
+        sBass=lerp(sBass,rB,.2f);sMid=lerp(sMid,rM,.2f);sHigh=lerp(sHigh,rH,.2f);
+        sAll=lerp(sAll,rA,.2f);sSub=lerp(sSub,rSub,.2f);
+        sLM=lerp(sLM,rLM,.2f);sHM=lerp(sHM,rHM,.2f);
+
+        SDL_GetRendererOutputSize(ren,&ww,&wh);
+        float cx=ww*.5f,cy=wh*.5f;
+
+        if(!g_neuronsInit)initNeurons(cx,cy,maxR,rng);
+        if(!g_rainInit)initRain(ww,wh,rng);
+        if(!g_geoInit)initGeo(cx,cy,maxR,rng);
+
+        updateKNodes(dt,sBass,sMid,sAll,maxR);
+        updateNeurons(dt,cx,cy,sHigh,sBass,maxR,t);
+        triggerShockwave(rB,t);
+        updateShockwaves(dt);
+        updateRain(dt,sHigh,sAll,wh);
+        updateGeo(dt,cx,cy,sBass,sAll);
+
+        SDL_Texture* prevFb=(frame%2==0)?fbA:fbB;
+        SDL_Texture* curFb =(frame%2==0)?fbB:fbA;
+
+        // Render layer effects
+        SDL_SetRenderTarget(ren,layerTex);
+        SDL_SetRenderDrawColor(ren,0,0,0,255);SDL_RenderClear(ren);
+        SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+
+        drawSubBassMembrane(ren,cx,cy,t,sSub,sBass,maxR,ww,wh);
+        drawSineWaves(ren,cx,cy,t,sLM,sBass,sAll,ww,wh);
+        float playScale=(g_music&&!g_paused)?0.22f:1.0f;
+        drawTunnel(ren,cx,cy,t,sBass*playScale,sAll*playScale,maxR);
+        drawWormhole(ren,cx,cy,t,sBass*playScale,sMid*playScale,sAll*playScale,maxR);
+        drawMegaLissajous(ren,cx,cy,t,sMid,sLM,sAll,maxR);
+        drawFractalBurst(ren,cx,cy,t,sHM,sMid,maxR);
+        drawNeuralNet(ren,sHigh,sHM,sBass);
+        drawShockwaves(ren,cx,cy,sBass);
+        drawBeatCube(ren,cx,cy,t,sBass,sAll);
+        drawSpectrumRing(ren,cx,cy,t,sBass,sMid,sHigh,sAll,spec,maxR);
+        drawGeoShapes(ren,sBass,sMid,sAll);
+        drawKaleidoscope(ren,cx,cy,sBass,sMid,sHigh,sAll,t,spec,maxR);
+        drawRibbonTornado(ren,cx,cy,t,sBass,sMid,sAll,maxR);
+        drawAurora(ren,cx,cy,t,sMid,sLM,sAll,ww,wh);
+        drawHypnoSpiral(ren,cx,cy,t,sMid,sBass,sAll,maxR);
+        drawRain(ren,sHigh,sAll,wh);
+        drawGalaxy(ren,cx,cy,t,sBass,sMid,sHigh,maxR);
+        SDL_SetRenderTarget(ren,nullptr);
+
+        // Feedback pass
+        SDL_SetRenderTarget(ren,curFb);
+        SDL_SetRenderDrawColor(ren,0,0,1,255);SDL_RenderClear(ren);
+        float feedbackZoom =1.014f+sAll*0.005f+sBass*0.004f;
+        float feedbackRot  =0.004f*(1.f+sAll*0.4f);
+        float feedbackAlpha=0.82f-sAll*0.08f;
+        float hueShift     =fmod(t*15.f,360.f);
+        SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+        blitFeedback(ren,prevFb,cx,cy,feedbackZoom,feedbackRot,feedbackAlpha,hueShift,ww,wh);
+        SDL_SetTextureBlendMode(layerTex,SDL_BLENDMODE_ADD);
+        SDL_SetTextureAlphaMod(layerTex,255);
+        SDL_SetTextureColorMod(layerTex,255,255,255);
+        SDL_RenderCopy(ren,layerTex,nullptr,nullptr);
+        SDL_SetRenderTarget(ren,nullptr);
+
+        // Composite to screen
+        SDL_SetRenderDrawColor(ren,0,0,1,255);SDL_RenderClear(ren);
+        if(rB>0.6f){
+            SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+            SDL_SetRenderDrawColor(ren,6,0,18,(Uint8)std::min((rB-.6f)*50.f,30.f));
+            SDL_RenderFillRect(ren,nullptr);
+        }
+        SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+        SDL_SetTextureBlendMode(curFb,SDL_BLENDMODE_ADD);
+        SDL_SetTextureAlphaMod(curFb,255);SDL_SetTextureColorMod(curFb,255,255,255);
+        SDL_RenderCopy(ren,curFb,nullptr,nullptr);
+
+        // UI idle fade
+        g_idleTimer+=dt;
+        float uiA=g_uiVisible?(g_idleTimer>5.f?std::max(0.f,1.f-(g_idleTimer-5.f)*0.5f):1.f):0.f;
+        // Always keep the menu button barely visible even when faded
+        float menuBtnMinAlpha = 0.25f;
+        float menuUiAlpha = std::max(uiA, menuBtnMinAlpha);
+        Uint8 uiAlpha=(Uint8)(uiA*220);
+        Uint8 menuAlpha=(Uint8)(menuUiAlpha*220);
+
+        // Draw panels
+        SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+        if(uiAlpha>0){
+            if(g_panel==UIPanel::Library)   drawLibraryPanel(ren,uiAlpha,g_panelBuildT,t);
+            if(g_panel==UIPanel::Playlists) drawPlaylistPanel(ren,uiAlpha,g_panelBuildT,t);
+            drawNowPlayingBar(ren,ww,wh,uiAlpha,t,sBass);
+            drawNamingOverlay(ren,ww,wh,uiAlpha,g_namingBuildT,t);
+        }
+        // Spotify UI always drawn when active (not affected by idle fade)
+        if(g_spotState!=SpotState::Idle)
+            drawSpotifyUI(ren,ww,wh,220,g_spotBuildT,t);
+
+        // Radial menu — drawn last so it's always on top
+        // Use menuAlpha so button stays ghostly visible even when idle
+        drawRadialMenu(ren, t, menuUiAlpha, sBass, sAll);
+
+        SDL_RenderPresent(ren);
+        SDL_Delay(std::max(0,(int)(1000/FPS)-(int)(SDL_GetTicks()-now)));
+        ++frame;
+    }
+
+    SDL_DestroyTexture(fbA);SDL_DestroyTexture(fbB);SDL_DestroyTexture(layerTex);
+    if(g_spotDlThread.joinable()){ g_spotDlRunning=false; g_spotDlThread.join(); }
+    if(g_music){Mix_HaltMusic();Mix_FreeMusic(g_music);}
+    fftw_destroy_plan(plan);fftw_free(fftOut);SDL_DestroyMutex(g_pcmMutex);
+    Mix_CloseAudio();Mix_Quit();SDL_DestroyRenderer(ren);SDL_DestroyWindow(win);
+    SDL_Quit();return 0;
+}
