@@ -1,0 +1,25 @@
+# Compiled output
+*.exe
+*.o
+*.a
+
+# Personal data
+library.dat
+spotify_config.txt
+audio_debug.txt
+download_debug.txt
+track_debug.txt
+
+# Downloaded music
+downloads/
+
+# DLLs and tools (users must supply their own)
+*.dll
+yt-dlp.exe
+ffmpeg.exe
+
+# VS Code
+.vscode/
+
+# Build artifacts
+*.log
