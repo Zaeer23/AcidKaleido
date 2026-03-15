@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Visualizer",
+      "type": "shell",
+      "command": "g++",
+      "args": [
+        "-std=c++17",
+        "-I", "C:/msys64/mingw64/include/SDL2",
+        "-I", "C:/msys64/mingw64/include",
+        "${workspaceFolder}/visualizer.cpp",
+        "-o", "${workspaceFolder}/visualizer.exe",
+        "-L", "C:/msys64/mingw64/lib",
+        "-lmingw32",
+        "-lSDL2main",
+        "-lSDL2",
+        "-lSDL2_mixer",
+        "-lSDL2_ttf",
+        "-lfftw3",
+        "-lwinhttp",
+        "-lws2_32",
+        "-lshell32",
+        "-lm",
+        "-mwindows",
+        "-O2"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}
