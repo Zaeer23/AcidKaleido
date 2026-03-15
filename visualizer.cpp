@@ -104,7 +104,11 @@ SDL_Color hsv(float h,float s,float v,float a=1.f){
 
 static Mix_Music* g_music=nullptr;static bool g_paused=false;
 static Uint32 g_lastTrackChange=0;
-static float  g_titleBuildT=1.f;  // 0=fresh track, 1=fully shown
+static float  g_titleBuildT=1.f;
+// Photosensitivity warning shown on startup
+static bool   g_warnActive  = true;  // shown until dismissed
+static float  g_warnBuildT  = 0.f;   // build-in animation
+static float  g_warnAlpha   = 0.f;   // fade out on dismiss
 static std::string g_exeDir; // set in main() — used by logErr before getExeDir is available
 void logErr(const std::string& msg){
     std::ofstream f(g_exeDir+"audio_debug.txt",std::ios::app);
@@ -1280,6 +1284,8 @@ enum class UIPanel { None, Library, Playlists };
 static UIPanel  g_panel      = UIPanel::None;
 static UIPanel  g_prevPanel  = UIPanel::None;
 static int      g_libScroll  = 0;
+static int      g_libScrollPrev = -1;
+static bool     g_libJustOpened = false; // triggers full stagger animation
 static int      g_plScroll   = 0;
 static int      g_selectedPL = -1;
 static char     g_newPLName[128] = "New Playlist";
@@ -1331,6 +1337,7 @@ std::string buildTypeOn(const std::string& target, float progress, float t){
 static constexpr int PANEL_W      = 320;
 static constexpr int ROW_H        = 32;
 static constexpr int VISIBLE_ROWS = 14;
+static float    g_rowBuildT[VISIBLE_ROWS+2] = {}; // per-row build timers
 
 bool inRect(int mx,int my,SDL_Rect r){
     return mx>=r.x&&mx<r.x+r.w&&my>=r.y&&my<r.y+r.h;
@@ -1441,68 +1448,51 @@ void drawBuildingBorder(SDL_Renderer* r, int x, int y, int w, int h,
     }
 }
 
-// Rich animated row — noise resolves into solid, then text types on
+// Animated row — text glitches in from corruption, no rainbow noise
 void drawAnimatedRow(SDL_Renderer* r, int x, int y, int w,
                      const std::string& label, bool selected, bool hovered,
                      Uint8 alpha, float rowProgress, float t, float hue){
     if(rowProgress <= 0.f) return;
 
-    // Phase 1 (0.0-0.35): noise static fills the row area
-    // Phase 2 (0.35-0.65): noise resolves, solid bg fades in, slide from left
-    // Phase 3 (0.65-1.0): text types on with glitch
+    // Always draw the solid background immediately — no noise phase
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    Uint8 bgAlpha = (Uint8)(alpha * smoothstep(clamp01(rowProgress * 3.f)));
+    if(selected)      SDL_SetRenderDrawColor(r,40,80,160,bgAlpha);
+    else if(hovered)  SDL_SetRenderDrawColor(r,25,40,80,bgAlpha);
+    else              SDL_SetRenderDrawColor(r,8,8,20,bgAlpha);
+    SDL_Rect rc={x, y, w, ROW_H-2}; SDL_RenderFillRect(r,&rc);
+    SDL_SetRenderDrawColor(r,40,60,120,(Uint8)(bgAlpha/2));
+    SDL_RenderDrawRect(r,&rc);
 
-    float slideX_f = x - (1.f - smoothstep(clamp01((rowProgress-0.35f)/0.3f))) * 80.f;
-    int slideX = (int)slideX_f;
+    // Color strip on left edge
+    SDL_Color tc = selected ? SDL_Color{100,180,255,bgAlpha}
+                            : SDL_Color{180,200,220,bgAlpha};
+    SDL_SetRenderDrawColor(r,tc.r,tc.g,tc.b,(Uint8)(bgAlpha*0.8f));
+    SDL_Rect strip={x+2,y+2,3,ROW_H-6}; SDL_RenderFillRect(r,&strip);
 
-    // Noise phase
-    if(rowProgress < 0.65f){
-        float noiseAmt = 1.f - clamp01((rowProgress - 0.f) / 0.65f);
-        drawNoiseRow(r, x-4, y, w+8, ROW_H-2, noiseAmt, t, hue, alpha);
+    // Subtle scan glow on leading edge while animating
+    if(rowProgress < 0.8f){
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+        SDL_Color scanC = hsv(hue, 0.8f, 1.f);
+        scanC.a = (Uint8)(bgAlpha * (1.f - rowProgress/0.8f) * 0.6f);
+        SDL_SetRenderDrawColor(r,scanC.r,scanC.g,scanC.b,scanC.a);
+        SDL_Rect scanR={x, y, 2, ROW_H-2}; SDL_RenderFillRect(r,&scanR);
     }
 
-    // Solid background fades in during phase 2
-    float bgFade = smoothstep(clamp01((rowProgress - 0.35f) / 0.3f));
-    if(bgFade > 0.f){
-        Uint8 rowAlpha = (Uint8)(alpha * bgFade);
-        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        if(selected)      SDL_SetRenderDrawColor(r,40,80,160,rowAlpha);
-        else if(hovered)  SDL_SetRenderDrawColor(r,25,40,80,rowAlpha);
-        else              SDL_SetRenderDrawColor(r,8,8,20,rowAlpha);
-        SDL_Rect rc={slideX, y, w, ROW_H-2}; SDL_RenderFillRect(r,&rc);
-        SDL_SetRenderDrawColor(r,40,60,120,(Uint8)(rowAlpha/2));
-        SDL_RenderDrawRect(r,&rc);
+    // Text — glitch corruption resolves into real name
+    // Clamp text rendering to stay within panel bounds
+    float typeP = clamp01((rowProgress - 0.15f) / 0.65f);
+    std::string typed = buildTypeOn(label, typeP, t);
+    Uint8 ta = (Uint8)(alpha * smoothstep(clamp01((rowProgress-0.1f)*3.f)));
+    SDL_Color txtC = selected ? SDL_Color{100,180,255,ta} : SDL_Color{180,200,220,ta};
 
-        // Color strip on left edge
-        SDL_Color tc = selected ? SDL_Color{100,180,255,rowAlpha}
-                                : SDL_Color{180,200,220,rowAlpha};
-        SDL_SetRenderDrawColor(r,tc.r,tc.g,tc.b,(Uint8)(rowAlpha*0.8f));
-        SDL_Rect strip={slideX+2,y+2,3,ROW_H-6}; SDL_RenderFillRect(r,&strip);
+    // Truncate label if too long to fit in panel
+    // Rough char width estimate: ~7px per char at small font
+    int maxChars = (w - 20) / 7;
+    if((int)typed.size() > maxChars)
+        typed = typed.substr(0, maxChars-2) + "..";
 
-        // Leading scan glow while sliding
-        if(rowProgress < 0.75f){
-            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
-            SDL_Color scanC = hsv(hue, 1.f, 1.f);
-            scanC.a = (Uint8)(rowAlpha * (1.f - (rowProgress-0.35f)/0.4f));
-            for(int g=0;g<5;++g){
-                float gf=(float)g/5.f;
-                SDL_Rect glowR={slideX-g*3, y, 4, ROW_H-2};
-                SDL_Color gc=scanC; gc.a=(Uint8)(scanC.a*(1.f-gf));
-                SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
-                SDL_RenderFillRect(r,&glowR);
-            }
-        }
-    }
-
-    // Text types on in phase 3
-    if(rowProgress > 0.65f){
-        float textFade = clamp01((rowProgress - 0.65f) / 0.35f);
-        float typeP = clamp01((rowProgress - 0.65f) / 0.22f);
-        std::string typed = buildTypeOn(label, typeP, t);
-        Uint8 ta = (Uint8)(alpha * textFade);
-        bool sel = selected;
-        SDL_Color tc = sel ? SDL_Color{100,180,255,ta} : SDL_Color{180,200,220,ta};
-        drawText(r, g_fontSm, typed, slideX+12, y+ROW_H/2-6, tc);
-    }
+    drawText(r, g_fontSm, typed, x+12, y+ROW_H/2-6, txtC);
 }
 
 // ── DRAMATIC PANEL DRAW ───────────────────────────────────────────────────────
@@ -1574,15 +1564,13 @@ void drawLibraryPanel(SDL_Renderer* r, Uint8 alpha, float buildT, float t) {
         }
     }
 
-    // Rows — each materialises individually
+    // Rows — each driven purely by g_rowBuildT, reset on open/scroll
     if(bp > 0.45f){
         int listY = py + 30;
         int visEnd = std::min(g_libScroll+VISIBLE_ROWS,(int)g_library.size());
         for(int i = g_libScroll; i < visEnd; ++i){
             int rowIdx = i - g_libScroll;
-            float rowStart = 0.45f + rowIdx * 0.032f;
-            float rowEnd   = rowStart + 0.40f;
-            float rowProg  = clamp01((bp - rowStart) / (rowEnd - rowStart));
+            float rowProg = clamp01(g_rowBuildT[rowIdx]);
             int ry = listY + rowIdx * ROW_H;
             float rowHue = fmod(hue + rowIdx * 18.f, 360.f);
             drawAnimatedRow(r, px+4, ry, PANEL_W-8,
@@ -1590,18 +1578,17 @@ void drawLibraryPanel(SDL_Renderer* r, Uint8 alpha, float buildT, float t) {
                             i==g_currentSong, i==g_hoverSong,
                             alpha, rowProg, t, rowHue);
         }
-
-        // Scrollbar fades in near end
-        if(bp > 0.90f && (int)g_library.size()>VISIBLE_ROWS){
-            float sbFade = clamp01((bp-0.90f)/0.10f);
+        // Scrollbar
+        if((int)g_library.size()>VISIBLE_ROWS){
             float st=(float)g_libScroll/g_library.size();
             float sh=(float)VISIBLE_ROWS/g_library.size();
             int sbY=py+30+(int)(VISIBLE_ROWS*ROW_H*st);
             int sbH=std::max(20,(int)(VISIBLE_ROWS*ROW_H*sh));
             SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-            SDL_Color sbc = hsv(hue,0.7f,1.f); sbc.a=(Uint8)(alpha*sbFade*0.8f);
+            SDL_Color sbc=hsv(hue,0.7f,1.f);
+            sbc.a=(Uint8)(alpha*clamp01((bp-0.45f)*4.f)*0.8f);
             SDL_SetRenderDrawColor(r,sbc.r,sbc.g,sbc.b,sbc.a);
-            SDL_Rect sb={px+PANEL_W-8,sbY,5,sbH}; SDL_RenderFillRect(r,&sb);
+            SDL_Rect sb={px+PANEL_W-8,sbY,5,sbH};SDL_RenderFillRect(r,&sb);
         }
     }
 
@@ -3118,6 +3105,81 @@ void spotSelectPlaylist(int idx){
     });
 }
 
+// ── PHOTOSENSITIVITY WARNING ──────────────────────────────────────────────────
+void drawWarning(SDL_Renderer* r, int ww, int wh, float buildT, float alpha, float t){
+    if(alpha <= 0.f) return;
+    float bp = clamp01(buildT);
+    Uint8 a = (Uint8)(alpha * 255.f);
+
+    // Full screen dim
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, (Uint8)(alpha * 200.f));
+    SDL_RenderFillRect(r, nullptr);
+
+    int ox = ww/2-260, oy = wh/2-140, ow = 520, oh = 280;
+
+    // Panel background + scanline build
+    float scanP = clamp01((bp-0.05f)/0.40f);
+    float revH  = scanP * oh;
+    if(revH > 0.f){
+        SDL_SetRenderDrawColor(r, 4, 3, 2, (Uint8)(alpha*0.97f*255.f));
+        SDL_Rect bg={ox,oy,ow,(int)revH}; SDL_RenderFillRect(r,&bg);
+    }
+    float hue = fmod(t*8.f + 20.f, 360.f); // slow amber/orange drift
+    drawScanSweep(r, ox, oy, ow, oh, scanP, t, hue);
+    SDL_Color bc = hsv(30.f, 0.9f, 1.f); bc.a = (Uint8)(alpha*0.95f*255.f);
+    drawBuildingBorder(r, ox, oy, ow, oh, smoothstep(clamp01(bp/0.35f)), t, bc);
+
+    if(bp > 0.30f){
+        float f = smoothstep(clamp01((bp-0.30f)/0.20f));
+        // Warning symbol
+        float tp = clamp01((bp-0.30f)/0.18f);
+        std::string hdr = buildTypeOn("⚠  PHOTOSENSITIVITY WARNING", tp, t);
+        SDL_Color tg = hsv(30.f,0.6f,1.f); tg.a=(Uint8)(alpha*f*0.4f*255.f);
+        for(int g=0;g<3;++g) drawText(r,g_font,hdr,ox+20+g,oy+16,tg,false);
+        SDL_Color tc = {255,200,80,(Uint8)(alpha*f*255.f)};
+        drawText(r, g_font, hdr, ox+20, oy+16, tc);
+
+        // Separator
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        SDL_Color sep=hsv(30.f,0.8f,1.f); sep.a=(Uint8)(alpha*f*0.5f*255.f);
+        SDL_SetRenderDrawColor(r,sep.r,sep.g,sep.b,sep.a);
+        SDL_Rect sl={ox+12,oy+38,ow-24,1}; SDL_RenderFillRect(r,&sl);
+    }
+
+    // Warning text lines — stagger in
+    struct WLine{ float start; const char* text; };
+    static const WLine lines[]={
+        {0.42f, "This application contains rapidly flashing lights,"},
+        {0.50f, "strobing effects, and high-contrast patterns that"},
+        {0.57f, "may trigger seizures in people with photosensitive"},
+        {0.63f, "epilepsy or other photosensitive conditions."},
+        {0.72f, "If you or anyone around you has a history of"},
+        {0.78f, "epilepsy or seizures, please consult a doctor"},
+        {0.83f, "before using this application."},
+    };
+    for(int i=0;i<7;++i){
+        if(bp <= lines[i].start) continue;
+        float lf = smoothstep(clamp01((bp-lines[i].start)/0.10f));
+        int lx = (int)(ox+20+(1.f-lf)*20.f);
+        Uint8 la = (Uint8)(alpha*lf*255.f);
+        bool isBold = (i==3||i==6); // last lines slightly brighter
+        SDL_Color lc = isBold ?
+            SDL_Color{220,200,160,la} : SDL_Color{170,155,120,la};
+        drawText(r, g_fontSm, lines[i].text, lx, oy+52+i*22, lc);
+    }
+
+    // Dismiss prompt — pulses
+    if(bp > 0.88f){
+        float f = smoothstep(clamp01((bp-0.88f)/0.12f));
+        float pulse = sinf(t*3.f)*0.15f+0.85f;
+        Uint8 pa = (Uint8)(alpha*f*pulse*255.f);
+        SDL_Color pc = {255,180,60,pa};
+        drawText(r, g_font, "[ PRESS ANY KEY OR CLICK TO CONTINUE ]",
+                 ww/2, oy+oh-24, pc, true);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3201,6 +3263,12 @@ int main(int argc,char** argv){
         SDL_Event ev;
         while(SDL_PollEvent(&ev)){
             if(ev.type==SDL_QUIT)running=false;
+            // Dismiss photosensitivity warning on any input
+            if(g_warnActive && g_warnBuildT > 0.88f){
+                if(ev.type==SDL_KEYDOWN||
+                   (ev.type==SDL_MOUSEBUTTONDOWN&&ev.button.button==SDL_BUTTON_LEFT))
+                    g_warnActive=false;
+            }
             if(ev.type==SDL_USEREVENT&&ev.user.code==1){
                 // Guard against rapid-fire: ignore if track just changed < 2s ago
                 if(SDL_GetTicks()-g_lastTrackChange > 2000)
@@ -3249,6 +3317,8 @@ int main(int argc,char** argv){
             }
 
             if(ev.type==SDL_KEYDOWN){
+                // Block all keyboard input while warning is active
+                if(g_warnActive) break;
                 if(g_namingPL){
                     if(ev.key.keysym.sym==SDLK_RETURN){
                         if(strlen(g_newPLName)>0){
@@ -3424,6 +3494,7 @@ int main(int argc,char** argv){
                             if(g_panel!=UIPanel::Library){
                                 g_panel=UIPanel::Library;
                                 g_panelBuildT=0.f; g_panelBuilding=true;
+                                g_libJustOpened=true;
                             } else { g_panel=UIPanel::None; }
                             break;
                         case MenuAction::Playlists:
@@ -3513,9 +3584,49 @@ int main(int argc,char** argv){
         updateMenu(dt);
         updateMenuRipples(dt);
         MENU_BTN_X = ww * 0.5f;
+
+        // Photosensitivity warning
+        if(g_warnActive){
+            g_warnBuildT += dt * 0.55f;
+            if(g_warnBuildT > 1.f) g_warnBuildT = 1.f;
+            g_warnAlpha = 1.f;
+        } else {
+            g_warnAlpha -= dt * 2.5f;
+            if(g_warnAlpha < 0.f) g_warnAlpha = 0.f;
+        }
         // Advance song title build animation
         if(g_titleBuildT < 1.f)
             g_titleBuildT = std::min(1.f, g_titleBuildT + dt * 1.2f);
+
+        // Advance per-row build timers
+        if(g_libJustOpened){
+            for(int i=0;i<VISIBLE_ROWS+2;++i)
+                g_rowBuildT[i] = -(float)i * 0.08f;
+            g_libScrollPrev = g_libScroll;
+            g_libJustOpened = false;
+        } else if(g_libScroll != g_libScrollPrev){
+            int delta = g_libScroll - g_libScrollPrev;
+            if(delta > 0){
+                for(int i=0;i<VISIBLE_ROWS-delta;++i)
+                    g_rowBuildT[i] = g_rowBuildT[i+delta];
+                for(int i=VISIBLE_ROWS-delta;i<VISIBLE_ROWS;++i)
+                    g_rowBuildT[i] = 0.f;
+            } else {
+                int absDelta = -delta;
+                for(int i=VISIBLE_ROWS-1;i>=absDelta;--i)
+                    g_rowBuildT[i] = g_rowBuildT[i-absDelta];
+                for(int i=0;i<absDelta;++i)
+                    g_rowBuildT[i] = 0.f;
+            }
+            g_libScrollPrev = g_libScroll;
+        }
+        // Only advance row timers once the panel is far enough built to show rows
+        if(g_panel==UIPanel::Library && g_panelBuildT > 0.45f){
+            for(int i=0;i<VISIBLE_ROWS;++i){
+                g_rowBuildT[i] += dt * 1.8f;
+                if(g_rowBuildT[i] > 1.f) g_rowBuildT[i] = 1.f;
+            }
+        }
 
         // Advance fake loading bar — crawls to 94% over 4s then stalls waiting for real auth
         if(g_spotState==SpotState::WaitingAuth||g_spotState==SpotState::FetchingPlaylists){
@@ -3634,7 +3745,8 @@ int main(int argc,char** argv){
         SDL_Texture* prevFb=(frame%2==0)?fbA:fbB;
         SDL_Texture* curFb =(frame%2==0)?fbB:fbA;
 
-        // Render layer effects
+        // Render layer effects — skip entirely while warning is showing
+        if(!g_warnActive || g_warnAlpha < 0.01f){
         SDL_SetRenderTarget(ren,layerTex);
         SDL_SetRenderDrawColor(ren,0,0,0,255);SDL_RenderClear(ren);
         SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
@@ -3673,18 +3785,21 @@ int main(int argc,char** argv){
         SDL_SetTextureColorMod(layerTex,255,255,255);
         SDL_RenderCopy(ren,layerTex,nullptr,nullptr);
         SDL_SetRenderTarget(ren,nullptr);
+        } // end skip-if-warning
 
         // Composite to screen
-        SDL_SetRenderDrawColor(ren,0,0,1,255);SDL_RenderClear(ren);
-        if(rB>0.6f){
+        SDL_SetRenderDrawColor(ren,0,0,0,255);SDL_RenderClear(ren);
+        if(!g_warnActive){
+            if(rB>0.6f){
+                SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+                SDL_SetRenderDrawColor(ren,6,0,18,(Uint8)std::min((rB-.6f)*50.f,30.f));
+                SDL_RenderFillRect(ren,nullptr);
+            }
             SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
-            SDL_SetRenderDrawColor(ren,6,0,18,(Uint8)std::min((rB-.6f)*50.f,30.f));
-            SDL_RenderFillRect(ren,nullptr);
+            SDL_SetTextureBlendMode(curFb,SDL_BLENDMODE_ADD);
+            SDL_SetTextureAlphaMod(curFb,255);SDL_SetTextureColorMod(curFb,255,255,255);
+            SDL_RenderCopy(ren,curFb,nullptr,nullptr);
         }
-        SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
-        SDL_SetTextureBlendMode(curFb,SDL_BLENDMODE_ADD);
-        SDL_SetTextureAlphaMod(curFb,255);SDL_SetTextureColorMod(curFb,255,255,255);
-        SDL_RenderCopy(ren,curFb,nullptr,nullptr);
 
         // UI idle fade
         g_idleTimer+=dt;
@@ -3710,6 +3825,10 @@ int main(int argc,char** argv){
         // Radial menu — drawn last so it's always on top
         // Use menuAlpha so button stays ghostly visible even when idle
         drawRadialMenu(ren, t, menuUiAlpha, sBass, sAll);
+
+        // Photosensitivity warning — drawn above everything
+        if(g_warnAlpha > 0.f)
+            drawWarning(ren, ww, wh, g_warnBuildT, g_warnAlpha, t);
 
         SDL_RenderPresent(ren);
         SDL_Delay(std::max(0,(int)(1000/FPS)-(int)(SDL_GetTicks()-now)));
