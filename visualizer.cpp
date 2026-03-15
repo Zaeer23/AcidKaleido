@@ -104,6 +104,7 @@ SDL_Color hsv(float h,float s,float v,float a=1.f){
 
 static Mix_Music* g_music=nullptr;static bool g_paused=false;
 static Uint32 g_lastTrackChange=0;
+static float  g_titleBuildT=1.f;  // 0=fresh track, 1=fully shown
 static std::string g_exeDir; // set in main() — used by logErr before getExeDir is available
 void logErr(const std::string& msg){
     std::ofstream f(g_exeDir+"audio_debug.txt",std::ios::app);
@@ -121,6 +122,7 @@ void loadAndPlay(const std::string& p){
         logErr("Mix_LoadMUS failed ["+p+"]: "+Mix_GetError());
     }
     g_lastTrackChange=SDL_GetTicks();
+    g_titleBuildT=0.f;
 }
 
 struct V2{float x,y;};
@@ -1285,6 +1287,9 @@ static bool     g_namingPL   = false;
 static int      g_hoverSong  = -1;
 static bool     g_uiVisible  = true;
 static float    g_idleTimer  = 0.f;
+// Progress bar drag state
+static bool     g_seekDragging = false;
+static float    g_seekPreview  = 0.f; // 0→1 preview position while dragging
 
 // Panel build animation
 static float g_panelBuildT   = 0.f;
@@ -1722,58 +1727,156 @@ int playlistClickRow(int mx,int my){
     return row-1;
 }
 bool onProgressBar(int mx,int my,int ww,int wh){
-    return mx>=80&&mx<=ww-80&&my>=wh-32&&my<=wh-20;
+    return mx>=80&&mx<=ww-80&&my>=wh-28&&my<=wh-4;
 }
 
-// ── BOTTOM NOW-PLAYING BAR ─────────────────────────────────────────────────────
-void drawNowPlayingBar(SDL_Renderer* r, int ww, int wh, Uint8 alpha, float t, float bass) {
+// ── BOTTOM NOW-PLAYING BAR — PLASMA EDITION ───────────────────────────────────
+void drawNowPlayingBar(SDL_Renderer* r, int ww, int wh, Uint8 alpha,
+                       float t, float bass, float overall,
+                       const std::vector<float>& spec) {
     if(alpha==0) return;
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
 
-    // Frosted dark bar
-    SDL_SetRenderDrawColor(r,4,4,12,(Uint8)(alpha*0.88f));
-    SDL_Rect botBar={0,wh-44,ww,44};SDL_RenderFillRect(r,&botBar);
-    // Top edge glow — cycles hue
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-    SDL_Color edgeC = hsv(fmod(t*18.f,360.f), 0.8f, 0.7f);
-    edgeC.a = (Uint8)(alpha * 0.7f);
-    SDL_SetRenderDrawColor(r,edgeC.r,edgeC.g,edgeC.b,edgeC.a);
-    SDL_Rect edgeLine={0,wh-45,ww,1};SDL_RenderFillRect(r,&edgeLine);
-
-    // Progress bar
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
     double pos=0,dur=1;
     if(g_music){pos=Mix_GetMusicPosition(g_music);dur=Mix_MusicDuration(g_music);}
     if(dur<=0)dur=1;
-    float prog=(float)(pos/dur);
-    int pbX=90,pbY=wh-28,pbW=ww-180,pbH=6;
-    SDL_SetRenderDrawColor(r,20,20,40,alpha);
-    SDL_Rect pbBg={pbX,pbY,pbW,pbH};SDL_RenderFillRect(r,&pbBg);
+    float prog = g_seekDragging ? g_seekPreview : clamp01((float)(pos/dur));
 
-    // Gradient fill for the progress bar
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-    SDL_Color pfc = hsv(fmod(t*20.f,360.f),0.9f,1.f); pfc.a=alpha;
-    SDL_SetRenderDrawColor(r,pfc.r,pfc.g,pfc.b,pfc.a);
-    SDL_Rect pbFill={pbX,pbY,(int)(pbW*prog),pbH};SDL_RenderFillRect(r,&pbFill);
+    int barH   = 28;                        // taller bar for plasma room
+    int barY   = wh - barH;
+    int pbX    = 80;
+    int pbW    = ww - 160;
+    int fillW  = (int)(pbW * prog);
 
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(r,80,140,200,(Uint8)(alpha*0.5f));
-    SDL_RenderDrawRect(r,&pbBg);
+    // ── Dark background panel ─────────────────────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 2, 2, 8, (Uint8)(alpha * 0.92f));
+    SDL_Rect panel={0, barY-16, ww, barH+16};
+    SDL_RenderFillRect(r, &panel);
 
-    // Playhead thumb
-    int thumbX=pbX+(int)(pbW*prog)-4;
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-    SDL_Color tc2 = hsv(fmod(t*20.f+40.f,360.f),0.6f,1.f); tc2.a=alpha;
-    SDL_SetRenderDrawColor(r,tc2.r,tc2.g,tc2.b,tc2.a);
-    SDL_Rect thumb={thumbX,pbY-3,8,pbH+6};SDL_RenderFillRect(r,&thumb);
+    // ── Upward glow bleed into the visualizer ─────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    int glowH = 40;
+    for(int g=0; g<glowH; ++g){
+        float gf = (float)g/glowH;
+        float ga = (1.f-gf)*(1.f-gf) * (0.06f + bass*0.08f);
+        SDL_Color gc = hsv(fmod(t*18.f, 360.f), 0.8f, 1.f);
+        gc.a = (Uint8)(ga * alpha);
+        SDL_SetRenderDrawColor(r, gc.r, gc.g, gc.b, gc.a);
+        SDL_Rect gline={0, barY-16-g, ww, 1};
+        SDL_RenderFillRect(r, &gline);
+    }
 
-    // Song title — centered
+    // ── Empty bar track ───────────────────────────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 15, 15, 30, (Uint8)(alpha*0.9f));
+    SDL_Rect track={pbX, barY+4, pbW, barH-8};
+    SDL_RenderFillRect(r, &track);
+
+    // ── PLASMA FILL ───────────────────────────────────────────────────────────
+    // Render column by column — each column gets a plasma height and color
+    // driven by overlapping sine waves at different frequencies
+    if(fillW > 0){
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+        for(int x=0; x<fillW; ++x){
+            float xf = (float)x / pbW;  // 0→1 across filled portion
+
+            // Sample nearby spectrum bin for per-column reactivity
+            int binIdx = std::clamp((int)(xf * 180), 0, FREQ_BINS-1);
+            float binVal = spec[binIdx];
+
+            // Plasma: sum of sines at different scales and speeds
+            float plasma =
+                sinf(xf * 12.f + t * 2.1f) * 0.28f +
+                sinf(xf * 6.f  - t * 1.4f) * 0.22f +
+                sinf(xf * 24.f + t * 3.7f) * 0.12f +
+                sinf(xf * 3.f  + t * 0.8f) * 0.20f +
+                sinf((xf + t * 0.3f) * 9.f) * 0.18f;
+            // Normalise to 0→1
+            plasma = plasma * 0.5f + 0.5f;
+            // Bass pumps the plasma amplitude
+            plasma = clamp01(plasma * (0.7f + bass * 0.6f + binVal * 0.3f));
+
+            // Hue shifts across the bar length + drifts with time
+            float hue = fmod(xf * 120.f + t * 25.f + bass * 30.f, 360.f);
+            SDL_Color col = hsv(hue, 0.9f, 1.f);
+
+            // Column height driven by plasma value
+            int colH = (int)((barH - 8) * plasma);
+            int colY = barY + 4 + (barH - 8 - colH);  // anchored to bottom
+
+            // Core column
+            col.a = (Uint8)(alpha * (0.55f + plasma * 0.45f));
+            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
+            SDL_Rect col_rect={pbX + x, colY, 1, colH};
+            SDL_RenderFillRect(r, &col_rect);
+
+            // Bright tip glow at the top of each column
+            SDL_Color tip = hsv(fmod(hue+30.f,360.f), 0.6f, 1.f);
+            tip.a = (Uint8)(alpha * plasma * 0.9f);
+            SDL_SetRenderDrawColor(r, tip.r, tip.g, tip.b, tip.a);
+            SDL_Rect tipR={pbX+x, colY, 1, std::min(3, colH)};
+            SDL_RenderFillRect(r, &tipR);
+        }
+
+        // Soft glow behind the plasma fill
+        for(int g=0; g<8; ++g){
+            float gf=(float)g/8.f;
+            SDL_Color gc=hsv(fmod(t*20.f,360.f),0.7f,1.f);
+            gc.a=(Uint8)(alpha*(1.f-gf)*(1.f-gf)*0.12f*(1.f+bass*0.5f));
+            SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+            SDL_Rect gr={pbX-g, barY+4-g, fillW+g*2, barH-8+g*2};
+            SDL_RenderFillRect(r,&gr);
+        }
+    }
+
+    // ── Playhead ──────────────────────────────────────────────────────────────
+    int thumbX = pbX + fillW;
+    // Drip glow — wider at top, tapers down
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    SDL_Color thumbC = hsv(fmod(t*30.f, 360.f), 0.5f, 1.f);
+    float dragBoost = g_seekDragging ? 2.0f : 1.0f;
+    for(int g=0; g<10; ++g){
+        float gf=(float)g/10.f;
+        thumbC.a=(Uint8)(std::min(255.f, alpha*(1.f-gf)*(1.f-gf)*0.8f*(1.f+bass*0.4f)*dragBoost));
+        SDL_SetRenderDrawColor(r,thumbC.r,thumbC.g,thumbC.b,thumbC.a);
+        SDL_Rect tr={thumbX-g, barY+2, 1+g*2, barH-4};
+        SDL_RenderFillRect(r,&tr);
+    }
+    // Bright core line
+    thumbC.a = alpha;
+    SDL_SetRenderDrawColor(r, thumbC.r, thumbC.g, thumbC.b, thumbC.a);
+    SDL_Rect thumbLine={thumbX-1, barY+2, 2, barH-4};
+    SDL_RenderFillRect(r, &thumbLine);
+
+    // ── Bar border ────────────────────────────────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 40, 40, 80, (Uint8)(alpha*0.4f));
+    SDL_RenderDrawRect(r, &track);
+
+    // ── Song title with glitch build animation ────────────────────────────────
     std::string nowPlaying="No track loaded";
     if(g_currentSong>=0&&g_currentSong<(int)g_library.size())
         nowPlaying=g_library[g_currentSong].title;
     else if(g_music) nowPlaying="Playing...";
-    SDL_Color titleC={180,220,255,alpha};
-    drawText(r,g_font,nowPlaying,ww/2,wh-42,titleC,true);
+
+    // Glitch type-on using same buildTypeOn as library panels
+    float typeP = clamp01(g_titleBuildT / 0.7f);
+    std::string displayed = buildTypeOn(nowPlaying, typeP, t);
+
+    // Fade in
+    float titleAlpha = smoothstep(clamp01(g_titleBuildT * 3.f));
+    Uint8 ta = (Uint8)(alpha * titleAlpha);
+
+    // Glow behind title — pulses on bass
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+    float glowHue = fmod(t*18.f, 360.f);
+    SDL_Color tglow = hsv(glowHue, 0.6f, 1.f);
+    tglow.a = (Uint8)(ta * 0.22f * (1.f + bass * 0.4f));
+    for(int g=0;g<3;++g)
+        drawText(r, g_fontSm, displayed, ww/2+g, barY-14, tglow, true);
+    // Crisp title — use smaller font
+    SDL_Color titleC={210, 230, 255, ta};
+    drawText(r, g_fontSm, displayed, ww/2, barY-14, titleC, true);
 }
 
 // New playlist name input overlay — dramatic build
@@ -3267,6 +3370,9 @@ int main(int argc,char** argv){
                 int mx=ev.motion.x,my=ev.motion.y;
                 g_menuHover = menuHoverTest(mx, my, g_menuOpen);
                 g_hoverSong = libraryClickRow(mx,my);
+                // Update seek preview while dragging
+                if(g_seekDragging)
+                    g_seekPreview=clamp01((float)(mx-80)/(ww-160));
                 // Spotify playlist hover
                 if(g_spotState==SpotState::PlaylistPicker){
                     int ox=10,oy=80,ow=360,listY=oy+30;
@@ -3295,11 +3401,10 @@ int main(int argc,char** argv){
                     }
                 }
 
-                // Progress bar seek
+                // Progress bar — start drag
                 if(onProgressBar(mx,my,ww,wh)&&g_music){
-                    double dur=Mix_MusicDuration(g_music);
-                    float frac=(float)(mx-80)/(ww-180);
-                    Mix_SetMusicPosition(dur*frac);
+                    g_seekDragging=true;
+                    g_seekPreview=clamp01((float)(mx-80)/(ww-160));
                 }
 
                 // Check menu trigger button
@@ -3381,6 +3486,16 @@ int main(int argc,char** argv){
                 }
             }
 
+            // Commit seek on mouse release
+            if(ev.type==SDL_MOUSEBUTTONUP&&ev.button.button==SDL_BUTTON_LEFT){
+                if(g_seekDragging&&g_music){
+                    double dur=Mix_MusicDuration(g_music);
+                    Mix_SetMusicPosition(dur*g_seekPreview);
+                    g_lastTrackChange=SDL_GetTicks();
+                }
+                g_seekDragging=false;
+            }
+
             if(ev.type==SDL_DROPFILE){
                 std::string f(ev.drop.file);SDL_free(ev.drop.file);
                 addToLibrary(f);g_currentSong=(int)g_library.size()-1;loadAndPlay(f);
@@ -3397,7 +3512,10 @@ int main(int argc,char** argv){
         // Update menu animation
         updateMenu(dt);
         updateMenuRipples(dt);
-        MENU_BTN_X = ww * 0.5f; // keep centered as window resizes
+        MENU_BTN_X = ww * 0.5f;
+        // Advance song title build animation
+        if(g_titleBuildT < 1.f)
+            g_titleBuildT = std::min(1.f, g_titleBuildT + dt * 1.2f);
 
         // Advance fake loading bar — crawls to 94% over 4s then stalls waiting for real auth
         if(g_spotState==SpotState::WaitingAuth||g_spotState==SpotState::FetchingPlaylists){
@@ -3582,7 +3700,7 @@ int main(int argc,char** argv){
         if(uiAlpha>0){
             if(g_panel==UIPanel::Library)   drawLibraryPanel(ren,uiAlpha,g_panelBuildT,t);
             if(g_panel==UIPanel::Playlists) drawPlaylistPanel(ren,uiAlpha,g_panelBuildT,t);
-            drawNowPlayingBar(ren,ww,wh,uiAlpha,t,sBass);
+            drawNowPlayingBar(ren,ww,wh,uiAlpha,t,sBass,sAll,spec);
             drawNamingOverlay(ren,ww,wh,uiAlpha,g_namingBuildT,t);
         }
         // Spotify UI always drawn when active (not affected by idle fade)
