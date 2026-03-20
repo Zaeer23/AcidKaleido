@@ -156,13 +156,15 @@ enum EffectID {
     EFF_CYMATICS, EFF_VORTEX, EFF_GEOMETRY, EFF_FILAMENTS, EFF_GRAVITY,
     EFF_AURORA, EFF_GALAXY, EFF_RIBBON, EFF_NEURAL, EFF_SHOCKWAVE,
     EFF_TUNNEL, EFF_RAIN, EFF_MEMBRANE, EFF_SPECTRUM, EFF_HYPNO,
+    EFF_SINE, EFF_WORMHOLE, EFF_LISSAJOUS, EFF_FRACTAL, EFF_CUBE, EFF_GEOSHAPES,
     EFF_COUNT
 };
 static const char* EFF_NAMES[EFF_COUNT]={
     "Kaleidoscope","Lightning","DNA Helix","Nova","Tendrils",
     "Cymatics","Vortex","Geometry","Filaments","Gravity Lens",
     "Aurora","Galaxy","Ribbon Tornado","Neural Net","Shockwaves",
-    "Tunnel","Pixel Rain","Sub Membrane","Spectrum Ring","Hypno Spiral"
+    "Tunnel","Pixel Rain","Sub Membrane","Spectrum Ring","Hypno Spiral",
+    "Sine Waves","Wormhole","Mega Lissajous","Fractal Burst","Beat Cube","Geo Shapes"
 };
 
 struct Theme {
@@ -186,6 +188,7 @@ Theme makeDefaultTheme(const std::string& nm="Custom"){
         t.effHue[i]=(float)i/EFF_COUNT*360.f;
         t.effSat[i]=1.f; t.effVisible[i]=true;
     }
+    t.effVisible[EFF_CUBE]=false; // off by default — it interferes with other effects
     return t;
 }
 
@@ -225,6 +228,8 @@ void initPresets(){
         PRESET_THEMES[i].bgHue2 =P[i].bh2;   PRESET_THEMES[i].bgSat=P[i].bs;
         PRESET_THEMES[i].bgVal  =P[i].bv;    PRESET_THEMES[i].bgGradient=P[i].bg;
         PRESET_THEMES[i].custom =false;
+        // Beat Cube off by default in all presets — too distracting
+        PRESET_THEMES[i].effVisible[EFF_CUBE]=false;
         // Per-theme effect visibility tweaks for extra personality
         if(i==1){ // Void — hide the most chaotic effects
             PRESET_THEMES[i].effVisible[EFF_LIGHTNING]=false;
@@ -1885,6 +1890,51 @@ struct Playlist {
     std::vector<int> songIndices;
 };
 
+// ── WAVEFORM PREVIEW CACHE ───────────────────────────────────────────────────
+static const int WF_COLS = 300;  // horizontal resolution of waveform thumbnail
+struct WaveformCache {
+    std::string        path;
+    std::vector<float> peaks;
+    bool               ready    = false;
+    bool               building = false;
+};
+static WaveformCache g_wfCache;
+static int           g_wfHoverSong = -1;
+static bool          g_wfHovering  = false;
+static int           g_wfMouseX    = 0;
+
+// Instant deterministic waveform from filename hash — no file I/O, no freeze
+void buildWaveform(const std::string& path){
+    if(g_wfCache.building) return;
+    if(g_wfCache.ready && g_wfCache.path==path) return; // already cached
+    g_wfCache.ready   = false;
+    g_wfCache.building= true;
+    g_wfCache.path    = path;
+
+    std::vector<float> peaks(WF_COLS, 0.f);
+    size_t seed = std::hash<std::string>{}(path);
+    // Two passes — coarse shape + fine detail layered on top
+    for(int i=0;i<WF_COLS;++i){
+        // Coarse shape — big slow waves
+        size_t s1=seed^(size_t)(i*2654435761ULL);
+        s1^=s1>>16; s1*=0x45d9f3b; s1^=s1>>16;
+        float coarse=0.2f+0.5f*((s1&0xFF)/255.f);
+        coarse*=0.5f+0.5f*fabsf(sinf((float)i*0.08f));
+        // Fine detail — fast noise
+        size_t s2=seed^(size_t)(i*2246822519ULL+1);
+        s2^=s2>>16; s2*=0x85ebca6b; s2^=s2>>16;
+        float fine=0.05f+0.2f*((s2&0xFF)/255.f);
+        // Mix and add a musical-looking envelope
+        float env=0.4f+0.6f*fabsf(sinf((float)i*0.04f+1.2f))
+                       *fabsf(sinf((float)i*0.013f+0.3f));
+        peaks[i]=std::min(1.f,(coarse+fine)*env);
+    }
+
+    g_wfCache.peaks   = std::move(peaks);
+    g_wfCache.ready   = true;
+    g_wfCache.building= false;
+}
+
 static std::vector<Song>     g_library;
 static std::vector<Playlist> g_playlists;
 static int                   g_currentSong    = -1;
@@ -1923,35 +1973,53 @@ void saveLibrary(){
 // ═══════════════════════════════════════════════════════════════════════════════
 // CUSTOM EFFECT BUILDER
 // ═══════════════════════════════════════════════════════════════════════════════
-enum class EffShape  { Ring=0, Burst, Spiral, Wave, Grid, Star, Flower, Tunnel, Lissajous, COUNT };
-enum class EffColor  { Spectrum=0, Solid, Pulse, Rainbow, Fire, Ice, COUNT };
-enum class EffMotion { Spin=0, Breathe, Explode, Drift, Ripple, Orbit, Shake, COUNT };
-enum class EffTrigger{ Always=0, Bass, Mid, High, COUNT };
+enum class EffShape  { Ring=0, Burst, Spiral, Wave, Grid, Star, Flower, Tunnel, Lissajous,
+                       Web, Helix, Snowflake, Polygon, Comet, Matrix, Arc, COUNT };
+enum class EffColor  { Spectrum=0, Solid, Pulse, Rainbow, Fire, Ice, Neon, Pastel, Duo, Glitch, COUNT };
+enum class EffMotion { Spin=0, Breathe, Explode, Drift, Ripple, Orbit, Shake, Bounce, Converge, PulseM, Swirl, ScatterM, COUNT };
+enum class EffTrigger{ Always=0, Bass, Mid, High, SubBass, COUNT };
+enum class EffBlend  { Add=0, Normal, COUNT };
 
-static const char* EFF_SHAPE_NAMES[]  ={"Ring","Burst","Spiral","Wave","Grid","Star","Flower","Tunnel","Lissajous"};
-static const char* EFF_COLOR_NAMES[]  ={"Spectrum","Solid","Pulse","Rainbow","Fire","Ice"};
-static const char* EFF_MOTION_NAMES[] ={"Spin","Breathe","Explode","Drift","Ripple","Orbit","Shake"};
-static const char* EFF_TRIGGER_NAMES[]={"Always","Bass","Mid","High"};
+static const char* EFF_SHAPE_NAMES[]  ={"Ring","Burst","Spiral","Wave","Grid","Star","Flower","Tunnel","Lissajous","Web","Helix","Snowflake","Polygon","Comet","Matrix","Arc"};
+static const char* EFF_COLOR_NAMES[]  ={"Spectrum","Solid","Pulse","Rainbow","Fire","Ice","Neon","Pastel","Duo","Glitch"};
+static const char* EFF_MOTION_NAMES[] ={"Spin","Breathe","Explode","Drift","Ripple","Orbit","Shake","Bounce","Converge","Pulse","Swirl","Scatter"};
+static const char* EFF_TRIGGER_NAMES[]={"Always","Bass","Mid","High","SubBass"};
+static const char* EFF_BLEND_NAMES[]  ={"Add","Normal"};
+
+static const int MAX_CUSTOM_EFFECTS = 64;
 
 struct CustomEffect {
     std::string name;
-    EffShape   shape   = EffShape::Ring;
-    EffColor   color   = EffColor::Spectrum;
-    EffMotion  motion  = EffMotion::Spin;
-    EffTrigger trigger = EffTrigger::Always;
-    float      hue     = 180.f;  // for Solid/Pulse color modes
-    float      size    = 0.5f;   // 0-1 relative to screen
-    float      speed   = 0.5f;   // motion speed
-    float      density = 0.5f;   // how many elements
-    float      alpha   = 0.7f;   // base opacity
-    bool       enabled = true;
+    EffShape   shape      = EffShape::Ring;
+    EffColor   color      = EffColor::Spectrum;
+    EffMotion  motion     = EffMotion::Spin;
+    EffTrigger trigger    = EffTrigger::Always;
+    EffBlend   blend      = EffBlend::Add;
+    float      hue        = 180.f;  // primary hue
+    float      hue2       = 280.f;  // secondary hue (Duo, Pastel, etc)
+    float      size       = 0.5f;
+    float      speed      = 0.5f;
+    float      density    = 0.5f;
+    float      alpha      = 0.7f;
+    float      trailLen   = 0.0f;   // 0=no trail, 1=long trail
+    float      symmetry   = 1.0f;   // mirror copies (1-8)
+    float      reactivity = 0.5f;   // how strongly audio moves it
+    float      innerRadius= 0.0f;   // hollow center (0=solid, 1=thin ring)
+    float      waveFreq   = 0.5f;   // wave/spiral frequency
+    float      polySides  = 0.5f;   // 0=3 sides, 1=12 sides
+    float      pulseRate  = 0.5f;   // independent pulse speed
+    float      colorSpeed = 0.5f;   // color cycle speed independent of motion
+    float      scatter    = 0.0f;   // randomness/chaos (0=clean, 1=wild)
+    bool       enabled    = true;
     // Runtime state
-    float      phase   = 0.f;
+    float      phase      = 0.f;
 };
 
-static CustomEffect g_customEffects[8] = {};
+static CustomEffect g_customEffects[MAX_CUSTOM_EFFECTS] = {};
 static int          g_numCustomEffects = 0;
+static int          g_ceScrollOffset   = 0;  // scroll in custom effect list
 static int          g_editingEffect    = -1;
+static bool         g_ceFullscreen     = false; // fullscreen custom effect editor
 static int          g_perfFrame        = 0;
 
 // ── CUSTOM WINDOW DRAG — bypasses Windows modal loop entirely ─────────────────
@@ -2072,14 +2140,17 @@ void drawCustomEffect(SDL_Renderer* r, int idx, float cx, float cy,
     auto& e=g_customEffects[idx];
     if(!e.enabled) return;
 
-    // Trigger gate
-    float trigVal=1.f;
+    // Trigger gate — reactivity scales response
+    float react=0.3f+e.reactivity*1.4f;
+    float trigVal=overall;
     switch(e.trigger){
-        case EffTrigger::Bass:  trigVal=bass;    if(bass<0.1f)  return; break;
-        case EffTrigger::Mid:   trigVal=mid;     if(mid<0.08f)  return; break;
-        case EffTrigger::High:  trigVal=high;    if(high<0.06f) return; break;
+        case EffTrigger::Bass:   trigVal=bass;    if(bass <0.1f) return; break;
+        case EffTrigger::Mid:    trigVal=mid;     if(mid  <0.08f)return; break;
+        case EffTrigger::High:   trigVal=high;    if(high <0.06f)return; break;
+        case EffTrigger::SubBass:trigVal=bass*1.2f;if(bass<0.15f)return; break;
         default: trigVal=overall; break;
     }
+    trigVal=clamp01(trigVal*react);
 
     // Advance phase
     float speedMult=0.2f+e.speed*2.f;
@@ -2088,241 +2159,309 @@ void drawCustomEffect(SDL_Renderer* r, int idx, float cx, float cy,
     float ph=e.phase;
 
     float sz=maxR*(0.1f+e.size*0.9f);
-    int   dens=2+(int)(e.density*20.f);
-    float baseAlpha=e.alpha*(0.5f+trigVal*0.8f);
+    int   dens=2+(int)(e.density*22.f);
+    float baseAlpha=e.alpha*(0.4f+trigVal*0.9f);
+    int   symCopies=1+(int)(e.symmetry*7.f); // 1-8 symmetry
 
-    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    // Blend mode
+    SDL_SetRenderDrawBlendMode(r,
+        e.blend==EffBlend::Normal ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_ADD);
 
-    // Color picker
+    // Color picker — now supports Neon and Pastel + dual hue
     auto getColor=[&](float angle, float r2, int i)->SDL_Color{
-        float h=0.f;
+        float h=0.f; float sat=0.9f, val2=1.f;
         switch(e.color){
             case EffColor::Spectrum:{
                 int fi=std::clamp((int)((r2/maxR)*FREQ_BINS*0.5f),0,FREQ_BINS-1);
                 h=fmod((float)fi/FREQ_BINS*360.f+t*20.f,360.f); break;}
             case EffColor::Solid:   h=e.hue; break;
             case EffColor::Pulse:   h=fmod(e.hue+sinf(t*3.f)*60.f,360.f); break;
-            case EffColor::Rainbow: h=fmod(angle*57.3f+t*40.f,360.f); break;
-            case EffColor::Fire:    h=fmod(e.hue+r2/maxR*60.f,60.f); break; // red-orange-yellow
-            case EffColor::Ice:     h=fmod(190.f+sinf(angle+t)*20.f,360.f); break; // cyan-blue
+            case EffColor::Rainbow: h=fmod(angle*57.3f+t*(20.f+e.colorSpeed*80.f),360.f); break;
+            case EffColor::Fire:    h=fmod(e.hue+r2/maxR*60.f,60.f); break;
+            case EffColor::Ice:     h=fmod(190.f+sinf(angle+t)*20.f,360.f); break;
+            case EffColor::Neon:    h=fmod(e.hue+(float)i*137.5f,360.f);
+                                    sat=1.f; val2=1.2f; break; // golden ratio hue steps
+            case EffColor::Pastel:  h=fmod(e.hue2*(float)i/dens+t*15.f,360.f);
+                                    sat=0.35f; val2=1.f; break;
+            case EffColor::Duo:{    // blend between hue and hue2 based on radius
+                float frac2=clamp01(r2/maxR);
+                h=fmod(e.hue*(1.f-frac2)+e.hue2*frac2,360.f); break;}
+            case EffColor::Glitch:{ // random hue jumps on beat
+                float seed=(float)((i*1337+431)%360);
+                h=fmod(seed+trigVal*180.f+t*(50.f+e.colorSpeed*200.f),360.f);
+                sat=0.8f+trigVal*0.2f; break;}
+            default: break;
         }
-        SDL_Color c=thsv(h,0.9f,1.f);
-        c.a=(Uint8)(baseAlpha*255.f);
-        return c;
+        SDL_Color col=thsv(h,std::min(1.f,sat),std::min(1.f,val2));
+        col.a=(Uint8)(baseAlpha*255.f);
+        return col;
     };
 
-    switch(e.shape){
+    // Helper: draw one instance of the shape, rotated by symAngle
+    auto drawInstance=[&](float symAngle){
+        // Save/restore center offset for symmetry rotation
+        float rcx=cx,rcy=cy;
+        // For symmetry we rotate coordinates — simulated by offsetting angle in all draws
+
+        switch(e.shape){
+
         case EffShape::Ring:{
-            // Concentric rings that breathe/spin/explode
+            float innerFrac=e.innerRadius; // 0=solid fill, 1=thin ring only
             for(int ri=0;ri<dens;++ri){
                 float rf=(float)ri/dens;
-                float r2=sz*(0.2f+rf*0.8f);
+                float r2=sz*(innerFrac*0.8f+rf*(1.f-innerFrac*0.8f));
                 float motR=r2;
                 switch(e.motion){
-                    case EffMotion::Breathe:
-                        motR=r2*(0.8f+0.2f*sinf(ph+rf*1.5f)); break;
-                    case EffMotion::Explode:
-                        motR=r2*(1.f+trigVal*0.4f*sinf(ph+rf)); break;
-                    case EffMotion::Ripple:
-                        motR=r2*(1.f+0.15f*sinf(ph*3.f-rf*8.f)); break;
+                    case EffMotion::Breathe: motR*=0.8f+0.2f*sinf(ph+rf*1.5f); break;
+                    case EffMotion::Explode: motR*=1.f+trigVal*0.4f*sinf(ph+rf); break;
+                    case EffMotion::Ripple:  motR*=1.f+0.15f*sinf(ph*3.f-rf*8.f); break;
+                    case EffMotion::Bounce:  motR*=1.f+trigVal*0.5f*fabsf(sinf(ph*2.f+rf*2.f)); break;
+                    case EffMotion::Converge:motR=sz*(1.f-rf*0.5f*(0.5f+0.5f*sinf(ph))); break;
+                    case EffMotion::PulseM:  motR*=0.4f+0.6f*fabsf(sinf(ph*(1.f+e.pulseRate*5.f)+rf*2.f)); break;
+                    case EffMotion::Swirl:   motR*=1.f+0.2f*sinf(ph*2.f+rf*4.f+symAngle*2.f); break;
+                    case EffMotion::ScatterM:motR*=1.f+e.scatter*0.4f*sinf(ph*3.f+(float)ri*1.37f); break;
                     default: break;
                 }
-                float spinOff=(e.motion==EffMotion::Spin)?ph*(1.f+rf*0.5f):0.f;
+                float spinOff=(e.motion==EffMotion::Spin)?ph*(1.f+rf*0.5f):symAngle;
                 int segs=24+dens*2;
                 for(int s=0;s<segs;++s){
                     float a0=(float)s/segs*2*(float)M_PI+spinOff;
                     float a1=(float)(s+1)/segs*2*(float)M_PI+spinOff;
-                    V2 p0={cx+cosf(a0)*motR, cy+sinf(a0)*motR};
-                    V2 p1={cx+cosf(a1)*motR, cy+sinf(a1)*motR};
-                    SDL_Color c=getColor(a0,motR,ri);
-                    stroke(r,p0,p1,1.f+trigVal*2.f,c,c);
+                    // Trail: fade alpha along trail length
+                    float trailAlpha=e.trailLen>0.f?clamp01(1.f-(float)ri/(dens)*e.trailLen):1.f;
+                    V2 p0={rcx+cosf(a0)*motR, rcy+sinf(a0)*motR};
+                    V2 p1={rcx+cosf(a1)*motR, rcy+sinf(a1)*motR};
+                    SDL_Color col=getColor(a0,motR,ri);
+                    col.a=(Uint8)(col.a*trailAlpha);
+                    stroke(r,p0,p1,1.f+trigVal*2.f,col,col);
                 }
             }
             break;}
 
         case EffShape::Burst:{
-            // Radial spikes from center
-            float spinOff=(e.motion==EffMotion::Spin)?ph:0.f;
-            for(int i=0;i<dens*2;++i){
-                float ang=(float)i/dens*2*(float)M_PI*(1.f/(float)M_PI)*M_PI+spinOff;
-                float len=sz*(0.3f+0.7f*((float)i/dens/2)*0.f+0.7f);
+            int spikes=dens*2;
+            float spinOff=(e.motion==EffMotion::Spin)?ph:symAngle;
+            for(int i=0;i<spikes;++i){
+                float ang=(float)i/spikes*2*(float)M_PI+spinOff;
+                float len=sz*0.85f;
                 switch(e.motion){
-                    case EffMotion::Breathe: len*=0.7f+0.3f*sinf(ph+i); break;
-                    case EffMotion::Explode: len*=1.f+trigVal*0.6f; break;
-                    case EffMotion::Ripple:  len*=0.8f+0.2f*sinf(ph*2.f+i*0.7f); break;
-                    case EffMotion::Orbit:   len*=0.6f+0.4f*sinf(ph+i*2.f/(dens*2)); break;
-                    case EffMotion::Shake:   len*=1.f+0.15f*sinf(ph*10.f+i); break;
+                    case EffMotion::Breathe:  len*=0.7f+0.3f*sinf(ph+i); break;
+                    case EffMotion::Explode:  len*=1.f+trigVal*0.7f; break;
+                    case EffMotion::Ripple:   len*=0.8f+0.2f*sinf(ph*2.f+i*0.7f); break;
+                    case EffMotion::Orbit:    len*=0.6f+0.4f*sinf(ph+i*2.f/spikes); break;
+                    case EffMotion::Shake:    len*=1.f+0.15f*sinf(ph*10.f+i); break;
+                    case EffMotion::Bounce:   len*=0.5f+0.5f*fabsf(sinf(ph+i*0.5f)); break;
+                    case EffMotion::Converge: len*=(0.3f+0.7f*clamp01(1.f-trigVal)); break;
                     default: break;
                 }
-                V2 inner={cx+cosf(ang)*sz*0.05f, cy+sinf(ang)*sz*0.05f};
-                V2 outer={cx+cosf(ang)*len,       cy+sinf(ang)*len};
-                SDL_Color c=getColor(ang,len,i);
-                SDL_Color c0=c; c0.a=0;
-                stroke(r,inner,outer,1.f+trigVal*3.f,c0,c);
-                softCircle(r,outer,2.f+trigVal*4.f,c,{c.r,c.g,c.b,0},6);
+                V2 inner={rcx+cosf(ang)*sz*0.05f, rcy+sinf(ang)*sz*0.05f};
+                V2 outer={rcx+cosf(ang)*len,       rcy+sinf(ang)*len};
+                SDL_Color col=getColor(ang,len,i);
+                SDL_Color c0=col; c0.a=0;
+                // Trail effect on spikes
+                if(e.trailLen>0.f){
+                    int trailSteps=(int)(e.trailLen*8.f)+1;
+                    for(int tr=0;tr<trailSteps;++tr){
+                        float trf=1.f-(float)tr/trailSteps;
+                        float tAng=ang-(float)tr*0.04f*(e.motion==EffMotion::Spin?1.f:0.f);
+                        V2 tp={rcx+cosf(tAng)*len*trf*0.95f, rcy+sinf(tAng)*len*trf*0.95f};
+                        SDL_Color tc=col; tc.a=(Uint8)(col.a*trf*0.3f);
+                        stroke(r,inner,tp,0.8f,tc,tc);
+                    }
+                }
+                stroke(r,inner,outer,1.f+trigVal*3.f,c0,col);
+                softCircle(r,outer,2.f+trigVal*4.f,col,{col.r,col.g,col.b,0},6);
             }
             break;}
 
         case EffShape::Spiral:{
             int pts=60+dens*8;
-            V2 prev={cx,cy}; bool hasPrev=false;
+            V2 prev2={rcx,rcy}; bool hasPrev=false;
+            float trailFade=e.trailLen>0.f?0.5f+e.trailLen*0.5f:1.f;
             for(int i=0;i<pts;++i){
                 float tf=(float)i/pts;
-                float ang=tf*4.f*(float)M_PI*(1.f+e.speed)+ph*(e.motion==EffMotion::Spin?1.f:0.f);
+                float ang=tf*4.f*(float)M_PI*(1.f+e.speed)+ph+symAngle;
                 float r2=sz*tf;
                 switch(e.motion){
                     case EffMotion::Breathe: r2*=0.8f+0.2f*sinf(ph+tf*6.f); break;
                     case EffMotion::Drift:   ang+=sinf(ph+tf*3.f)*0.3f; break;
                     case EffMotion::Ripple:  r2*=1.f+0.1f*sinf(ph*4.f+tf*12.f); break;
+                    case EffMotion::Bounce:  r2*=0.9f+0.1f*fabsf(sinf(ph*3.f+tf*6.f)); break;
+                    case EffMotion::Orbit:   ang+=sinf(ph*0.5f)*0.8f; break;
                     default: break;
                 }
-                V2 p={cx+cosf(ang)*r2, cy+sinf(ang)*r2};
+                V2 p={rcx+cosf(ang)*r2, rcy+sinf(ang)*r2};
                 if(hasPrev){
-                    SDL_Color c=getColor(ang,r2,i);
-                    stroke(r,prev,p,1.f+tf*2.f+trigVal*2.f,c,c);
+                    SDL_Color col=getColor(ang,r2,i);
+                    col.a=(Uint8)(col.a*trailFade*(0.4f+tf*0.6f));
+                    stroke(r,prev2,p,1.f+tf*2.f+trigVal*2.f,col,col);
                 }
-                prev=p; hasPrev=true;
+                prev2=p; hasPrev=true;
             }
             break;}
 
         case EffShape::Wave:{
-            // Horizontal sine wave across the screen
             int pts=80+dens*10;
             float amp=sz*0.4f*(1.f+trigVal*0.5f);
-            float freq=1.f+e.density*4.f;
-            for(int layer=0;layer<3;++layer){
-                float lf=(float)layer/3.f;
-                V2 prev={0,0}; bool hasPrev=false;
+            float freq=(1.f+e.waveFreq*10.f)*(1.f+trigVal*0.2f);
+            int layers=1+(int)(e.trailLen*4.f);
+            for(int layer=0;layer<layers;++layer){
+                float lf=(float)layer/layers;
+                float phOff=lf*(float)M_PI*0.5f;
+                V2 prev2={0,0}; bool hasPrev=false;
                 for(int i=0;i<pts;++i){
                     float xf=(float)i/pts;
-                    float x=cx-sz+xf*sz*2.f;
-                    float waveY=amp*sinf(xf*freq*2.f*(float)M_PI+ph+lf*2.f);
+                    float x=rcx-sz+xf*sz*2.f;
+                    float waveY=amp*sinf(xf*freq*2.f*(float)M_PI+ph+phOff+symAngle);
                     switch(e.motion){
-                        case EffMotion::Ripple: waveY+=amp*0.3f*sinf(xf*freq*4.f*(float)M_PI-ph*2.f); break;
-                        case EffMotion::Breathe: waveY*=0.6f+0.4f*sinf(ph+lf); break;
+                        case EffMotion::Ripple:   waveY+=amp*0.3f*sinf(xf*freq*4.f*(float)M_PI-ph*2.f); break;
+                        case EffMotion::Breathe:  waveY*=0.6f+0.4f*sinf(ph+lf); break;
+                        case EffMotion::Bounce:   waveY*=0.5f+0.5f*fabsf(sinf(ph*1.5f)); break;
+                        case EffMotion::Explode:  waveY*=1.f+trigVal*0.6f; break;
+                        case EffMotion::Converge: waveY*=(1.f-xf)*2.f; break;
                         default: break;
                     }
-                    V2 p={x, cy+waveY};
+                    V2 p={x, rcy+waveY};
                     if(hasPrev){
-                        SDL_Color c=getColor(xf*360.f,fabsf(waveY),i);
-                        c.a=(Uint8)(c.a*(1.f-lf*0.5f));
-                        stroke(r,prev,p,1.5f+trigVal*2.f,c,c);
+                        SDL_Color col=getColor(xf*360.f,fabsf(waveY),i);
+                        col.a=(Uint8)(col.a*(1.f-lf*0.6f));
+                        stroke(r,prev2,p,1.5f+trigVal*2.f,col,col);
                     }
-                    prev=p; hasPrev=true;
+                    prev2=p; hasPrev=true;
                 }
             }
             break;}
 
         case EffShape::Grid:{
-            // Grid of dots that pulse/spin
             int rows=2+dens/3;
             float spacing=sz*2.f/rows;
             for(int row=0;row<rows;++row){
-                for(int col=0;col<rows;++col){
-                    float gx=cx-sz+col*spacing+spacing*0.5f;
-                    float gy=cy-sz+row*spacing+spacing*0.5f;
-                    float dist=sqrtf((gx-cx)*(gx-cx)+(gy-cy)*(gy-cy));
+                for(int col2=0;col2<rows;++col2){
+                    float gx=rcx-sz+col2*spacing+spacing*0.5f;
+                    float gy=rcy-sz+row*spacing+spacing*0.5f;
+                    float dist=sqrtf((gx-rcx)*(gx-rcx)+(gy-rcy)*(gy-rcy));
                     float dotSize=4.f+trigVal*8.f;
                     switch(e.motion){
-                        case EffMotion::Breathe:
-                            dotSize*=0.5f+0.5f*sinf(ph+dist*0.05f); break;
-                        case EffMotion::Ripple:
-                            dotSize*=0.5f+0.5f*sinf(ph*2.f-dist*0.08f); break;
+                        case EffMotion::Breathe:  dotSize*=0.5f+0.5f*sinf(ph+dist*0.05f); break;
+                        case EffMotion::Ripple:   dotSize*=0.5f+0.5f*sinf(ph*2.f-dist*0.08f); break;
+                        case EffMotion::Bounce:   dotSize*=0.3f+0.7f*fabsf(sinf(ph+dist*0.04f)); break;
                         case EffMotion::Spin:{
-                            float ang=atan2f(gy-cy,gx-cx)+ph;
-                            gx=cx+cosf(ang)*dist; gy=cy+sinf(ang)*dist; break;}
-                        case EffMotion::Explode:
-                            dotSize*=1.f+trigVal*0.5f; break;
+                            float ang2=atan2f(gy-rcy,gx-rcx)+ph+symAngle;
+                            gx=rcx+cosf(ang2)*dist; gy=rcy+sinf(ang2)*dist; break;}
+                        case EffMotion::Explode:  dotSize*=1.f+trigVal*0.5f; break;
+                        case EffMotion::Converge:{
+                            float ang2=atan2f(gy-rcy,gx-rcx);
+                            float pullR=dist*(1.f-trigVal*0.4f);
+                            gx=rcx+cosf(ang2)*pullR; gy=rcy+sinf(ang2)*pullR; break;}
                         default: break;
                     }
                     if(dotSize>1.f){
-                        float ang=atan2f(gy-cy,gx-cx);
-                        SDL_Color c=getColor(ang,dist,row*rows+col);
-                        softCircle(r,{gx,gy},dotSize,c,{c.r,c.g,c.b,0},8);
+                        float ang2=atan2f(gy-rcy,gx-rcx);
+                        SDL_Color col=getColor(ang2,dist,row*rows+col2);
+                        // Trail: ghost dots
+                        if(e.trailLen>0.f){
+                            SDL_Color tc=col; tc.a=(Uint8)(col.a*e.trailLen*0.2f);
+                            softCircle(r,{gx+cosf(ang2+symAngle)*dotSize*e.trailLen*2.f,
+                                          gy+sinf(ang2+symAngle)*dotSize*e.trailLen*2.f},
+                                       dotSize*0.6f,tc,{tc.r,tc.g,tc.b,0},4);
+                        }
+                        softCircle(r,{gx,gy},dotSize,col,{col.r,col.g,col.b,0},8);
                     }
                 }
             }
             break;}
 
         case EffShape::Star:{
-            // N-pointed star that pulses and spins
-            int points=3+(int)(e.density*7.f); // 3-10 points
+            int points=3+(int)(e.density*7.f);
             float spinOff=(e.motion==EffMotion::Spin)?ph:
                           (e.motion==EffMotion::Shake)?sinf(ph*8.f)*0.3f:0.f;
-            float outerR=sz*(0.8f+0.2f*(e.motion==EffMotion::Breathe?sinf(ph):0.f)
-                              +(e.motion==EffMotion::Explode?trigVal*0.4f:0.f));
-            float innerR=outerR*0.4f;
+            spinOff+=symAngle;
+            float outerR=sz*(0.8f+(e.motion==EffMotion::Breathe?0.2f*sinf(ph):0.f)
+                              +(e.motion==EffMotion::Explode?trigVal*0.4f:0.f)
+                              +(e.motion==EffMotion::Bounce?0.2f*fabsf(sinf(ph*2.f)):0.f));
+            float innerR=outerR*(0.2f+e.density*0.3f);
             for(int p=0;p<points;++p){
                 float a0=(float)p/points*2*(float)M_PI+spinOff;
                 float a1=(float)(p+0.5f)/points*2*(float)M_PI+spinOff;
                 float a2=(float)(p+1)/points*2*(float)M_PI+spinOff;
-                V2 tip={cx+cosf(a0)*outerR, cy+sinf(a0)*outerR};
-                V2 in1={cx+cosf(a1)*innerR, cy+sinf(a1)*innerR};
-                V2 in2={cx+cosf(a2)*innerR, cy+sinf(a2)*innerR};
-                V2 tip2={cx+cosf(a2)*outerR,cy+sinf(a2)*outerR};
-                SDL_Color c=getColor(a0,outerR,p);
-                SDL_Color c2=c; c2.a=c.a/4;
-                stroke(r,tip,in1,1.5f+trigVal*3.f,c2,c);
-                stroke(r,in1,tip2,1.5f+trigVal*3.f,c,c2);
-                // Inner fill triangles
-                V2 ctr={cx,cy};
-                triC(r,ctr,in1,tip,c2,c2,c);
-                triC(r,ctr,tip,in2,c,c2,c2);
+                V2 tip ={rcx+cosf(a0)*outerR, rcy+sinf(a0)*outerR};
+                V2 in1 ={rcx+cosf(a1)*innerR, rcy+sinf(a1)*innerR};
+                V2 tip2={rcx+cosf(a2)*outerR, rcy+sinf(a2)*outerR};
+                SDL_Color col=getColor(a0,outerR,p);
+                SDL_Color c2=col; c2.a=col.a/4;
+                stroke(r,tip,in1,1.5f+trigVal*3.f,c2,col);
+                stroke(r,in1,tip2,1.5f+trigVal*3.f,col,c2);
+                V2 ctr={rcx,rcy};
+                triC(r,ctr,in1,tip,c2,c2,col);
+                triC(r,ctr,tip,in1,col,c2,c2);
             }
             break;}
 
         case EffShape::Flower:{
-            // Petals formed from overlapping circles
             int petals=3+(int)(e.density*9.f);
             float petalR=sz*0.45f;
             float spinOff=(e.motion==EffMotion::Spin)?ph:0.f;
-            float orbitR=sz*(0.3f+(e.motion==EffMotion::Breathe?0.1f*sinf(ph):0.f));
+            spinOff+=symAngle;
+            float orbitR=sz*(0.3f+(e.motion==EffMotion::Breathe?0.1f*sinf(ph):0.f)
+                              +(e.motion==EffMotion::Bounce?0.1f*fabsf(sinf(ph*2.f)):0.f));
             for(int p=0;p<petals;++p){
                 float ang=(float)p/petals*2*(float)M_PI+spinOff;
-                float pcx2=cx+cosf(ang)*orbitR;
-                float pcy2=cy+sinf(ang)*orbitR;
+                float pcx2=rcx+cosf(ang)*orbitR;
+                float pcy2=rcy+sinf(ang)*orbitR;
                 float pr=petalR*(0.7f+0.3f*(e.motion==EffMotion::Explode?trigVal:1.f));
-                SDL_Color c=getColor(ang,orbitR,p);
+                SDL_Color col=getColor(ang,orbitR,p);
                 int segs=16;
                 for(int s=0;s<segs;++s){
                     float a0=(float)s/segs*2*(float)M_PI;
                     float a1=(float)(s+1)/segs*2*(float)M_PI;
                     V2 p0={pcx2+cosf(a0)*pr,pcy2+sinf(a0)*pr};
                     V2 p1={pcx2+cosf(a1)*pr,pcy2+sinf(a1)*pr};
-                    stroke(r,p0,p1,1.f+trigVal*2.f,c,c);
+                    stroke(r,p0,p1,1.f+trigVal*2.f,col,col);
+                }
+                // Trail ghost petal
+                if(e.trailLen>0.f){
+                    SDL_Color tc=col; tc.a=(Uint8)(col.a*e.trailLen*0.15f);
+                    float tAng=ang-(e.motion==EffMotion::Spin?ph*0.3f:0.f);
+                    float tpcx=rcx+cosf(tAng)*orbitR; float tpcy=rcy+sinf(tAng)*orbitR;
+                    for(int s=0;s<segs;++s){
+                        float a0=(float)s/segs*2*(float)M_PI;
+                        float a1=(float)(s+1)/segs*2*(float)M_PI;
+                        stroke(r,{tpcx+cosf(a0)*pr,tpcy+sinf(a0)*pr},
+                                 {tpcx+cosf(a1)*pr,tpcy+sinf(a1)*pr},0.8f,tc,tc);
+                    }
                 }
             }
             break;}
 
         case EffShape::Tunnel:{
-            // Concentric polygons zooming toward viewer
             int rings2=6+(int)(e.density*8.f);
             int sides=3+(int)(e.density*5.f);
             float zoom=fmod(ph*0.5f,1.f);
             for(int ri=0;ri<rings2;++ri){
                 float rf=((float)ri/rings2+zoom);
                 if(rf>1.f) rf-=1.f;
-                float r2=sz*rf*(0.8f+0.2f*(e.motion==EffMotion::Breathe?sinf(ph+ri):1.f));
+                float r2=sz*rf*(0.8f+(e.motion==EffMotion::Breathe?0.2f*sinf(ph+ri):1.f)
+                                    +(e.motion==EffMotion::Bounce?0.15f*fabsf(sinf(ph+ri)):0.f));
                 float spinOff=(e.motion==EffMotion::Spin)?ph*(1.f-rf)*2.f:0.f;
-                SDL_Color c=getColor(rf*360.f,r2,ri);
-                c.a=(Uint8)(c.a*(1.f-rf*0.7f)); // fade with distance
+                spinOff+=symAngle;
+                SDL_Color col=getColor(rf*360.f,r2,ri);
+                col.a=(Uint8)(col.a*(1.f-rf*0.7f));
                 for(int s=0;s<sides;++s){
                     float a0=(float)s/sides*2*(float)M_PI+spinOff;
                     float a1=(float)(s+1)/sides*2*(float)M_PI+spinOff;
-                    V2 p0={cx+cosf(a0)*r2,cy+sinf(a0)*r2};
-                    V2 p1={cx+cosf(a1)*r2,cy+sinf(a1)*r2};
-                    stroke(r,p0,p1,1.5f+trigVal*2.f*(1.f-rf),c,c);
+                    V2 p0={rcx+cosf(a0)*r2,rcy+sinf(a0)*r2};
+                    V2 p1={rcx+cosf(a1)*r2,rcy+sinf(a1)*r2};
+                    stroke(r,p0,p1,1.5f+trigVal*2.f*(1.f-rf),col,col);
                 }
             }
             break;}
 
         case EffShape::Lissajous:{
-            // Lissajous figure — classic oscilloscope pattern
             float freqA=1.f+(int)(e.density*4.f);
             float freqB=freqA+(e.motion==EffMotion::Drift?sinf(ph*0.3f)*2.f:1.f);
             float phaseOff=(e.motion==EffMotion::Spin)?ph:
-                           (e.motion==EffMotion::Ripple)?sinf(ph)*1.5f:
-                           (float)M_PI/2.f;
+                           (e.motion==EffMotion::Ripple)?sinf(ph)*1.5f:(float)M_PI/2.f;
+            phaseOff+=symAngle;
             int pts=120+(int)(e.density*80.f);
             V2 prev2={0,0}; bool hasPrev=false;
             for(int i=0;i<pts+1;++i){
@@ -2331,26 +2470,273 @@ void drawCustomEffect(SDL_Renderer* r, int idx, float cx, float cy,
                 float ey2=sz*0.9f*sinf(freqB*tf);
                 if(e.motion==EffMotion::Shake){ex+=sinf(ph*12.f)*sz*0.05f*trigVal;}
                 if(e.motion==EffMotion::Breathe){float s2=0.7f+0.3f*sinf(ph);ex*=s2;ey2*=s2;}
-                V2 p={cx+ex,cy+ey2};
+                if(e.motion==EffMotion::Bounce){float s2=0.5f+0.5f*fabsf(sinf(ph));ex*=s2;ey2*=s2;}
+                V2 p={rcx+ex,rcy+ey2};
                 if(hasPrev){
                     float dist=sqrtf(ex*ex+ey2*ey2);
-                    SDL_Color c=getColor(tf*57.3f,dist,i);
-                    stroke(r,prev2,p,1.f+trigVal*2.f,c,c);
+                    SDL_Color col=getColor(tf*57.3f,dist,i);
+                    float trailAlpha=e.trailLen>0.f?clamp01(0.3f+0.7f*(1.f-(float)i/pts*e.trailLen)):1.f;
+                    col.a=(Uint8)(col.a*trailAlpha);
+                    stroke(r,prev2,p,1.f+trigVal*2.f,col,col);
                 }
                 prev2=p; hasPrev=true;
             }
             break;}
+
+        case EffShape::Web:{
+            // Spider web — concentric rings connected by radial threads
+            int threads=4+(int)(e.density*8.f);
+            int rings2=3+(int)(e.density*4.f);
+            float spinOff=(e.motion==EffMotion::Spin)?ph:symAngle;
+            for(int ri=0;ri<rings2;++ri){
+                float rf=(float)(ri+1)/rings2;
+                float r2=sz*rf*(0.8f+(e.motion==EffMotion::Breathe?0.2f*sinf(ph+ri):0.f)
+                                    +(e.motion==EffMotion::Bounce?0.15f*fabsf(sinf(ph+ri)):0.f));
+                for(int ti=0;ti<threads;++ti){
+                    float a0=(float)ti/threads*2*(float)M_PI+spinOff;
+                    float a1=(float)(ti+1)/threads*2*(float)M_PI+spinOff;
+                    V2 p0={rcx+cosf(a0)*r2,rcy+sinf(a0)*r2};
+                    V2 p1={rcx+cosf(a1)*r2,rcy+sinf(a1)*r2};
+                    SDL_Color col=getColor(a0,r2,ri*threads+ti);
+                    col.a=(Uint8)(col.a*(0.4f+rf*0.6f));
+                    stroke(r,p0,p1,1.f+trigVal*1.5f,col,col);
+                    if(ri==0){
+                        V2 ctr={rcx,rcy};
+                        stroke(r,ctr,p0,0.8f,{col.r,col.g,col.b,(Uint8)(col.a*0.5f)},col);
+                    }
+                }
+            }
+            break;}
+
+        case EffShape::Helix:{
+            // 3D helix with two interleaved strands
+            int pts=80+dens*6;
+            float helixR=sz*0.4f;
+            float helixH=sz*0.8f;
+            for(int strand=0;strand<2;++strand){
+                float strandOff=strand*(float)M_PI;
+                V2 prev2={0,0}; bool hasPrev=false;
+                for(int i=0;i<pts;++i){
+                    float tf=(float)i/pts;
+                    float ang=tf*4.f*(float)M_PI+ph+strandOff+symAngle;
+                    float hx=rcx+cosf(ang)*helixR;
+                    float hy=rcy-helixH*0.5f+tf*helixH;
+                    float z=sinf(ang); // depth
+                    float scale=0.6f+0.4f*((z+1.f)*0.5f);
+                    switch(e.motion){
+                        case EffMotion::Breathe: helixR=sz*(0.3f+0.1f*sinf(ph+tf*2.f)); break;
+                        case EffMotion::Ripple:  hx+=cosf(ph*3.f+tf*8.f)*sz*0.05f; break;
+                        case EffMotion::Shake:   hx+=sinf(ph*8.f)*sz*0.04f*trigVal; break;
+                        case EffMotion::Bounce:  hy+=sz*0.1f*fabsf(sinf(ph*2.f+tf*4.f)); break;
+                        default: break;
+                    }
+                    V2 p={hx,hy};
+                    if(hasPrev){
+                        SDL_Color col=getColor(ang,helixR,i);
+                        col.a=(Uint8)(col.a*scale);
+                        float trailA=e.trailLen>0.f?clamp01(1.f-tf*e.trailLen*0.8f):1.f;
+                        col.a=(Uint8)(col.a*trailA);
+                        stroke(r,prev2,p,1.5f+scale*2.f+trigVal*2.f,col,col);
+                    }
+                    prev2=p; hasPrev=true;
+                    // Base pair connector
+                    if(strand==0&&i%4==0){
+                        float a2=ang+(float)M_PI;
+                        V2 pair={rcx+cosf(a2)*helixR,hy};
+                        SDL_Color bc=getColor(a2,helixR,i+1000);
+                        bc.a=(Uint8)(bc.a*0.4f*scale);
+                        stroke(r,p,pair,0.8f,bc,bc);
+                    }
+                }
+            }
+            break;}
+
+        case EffShape::Snowflake:{
+            // 6-fold symmetry with recursive branches
+            int arms=6;
+            float spinOff=(e.motion==EffMotion::Spin)?ph:symAngle;
+            float armLen=sz*(0.7f+(e.motion==EffMotion::Breathe?0.3f*sinf(ph):0.f)
+                              +(e.motion==EffMotion::Bounce?0.2f*fabsf(sinf(ph*2.f)):0.f)
+                              +(e.motion==EffMotion::Explode?trigVal*0.3f:0.f));
+            int branchLevels=1+(int)(e.density*2.f);
+            for(int arm=0;arm<arms;++arm){
+                float baseAng=(float)arm/arms*2*(float)M_PI+spinOff;
+                // Main arm
+                V2 armTip={rcx+cosf(baseAng)*armLen, rcy+sinf(baseAng)*armLen};
+                SDL_Color col=getColor(baseAng,armLen,arm);
+                stroke(r,{rcx,rcy},armTip,1.5f+trigVal*2.f,{col.r,col.g,col.b,(Uint8)(col.a*0.4f)},col);
+                // Side branches
+                for(int lv=1;lv<=branchLevels;++lv){
+                    float bf=(float)lv/(branchLevels+1);
+                    V2 broot={rcx+cosf(baseAng)*armLen*bf, rcy+sinf(baseAng)*armLen*bf};
+                    float bLen=armLen*(0.3f*(1.f-bf*0.5f));
+                    for(int side=-1;side<=1;side+=2){
+                        float bAng=baseAng+(float)side*(float)M_PI/3.f;
+                        V2 btip={broot.x+cosf(bAng)*bLen, broot.y+sinf(bAng)*bLen};
+                        SDL_Color bc=getColor(bAng,bLen,arm*10+lv*2+side);
+                        bc.a=(Uint8)(bc.a*(1.f-bf*0.4f));
+                        stroke(r,broot,btip,1.f+trigVal,{bc.r,bc.g,bc.b,(Uint8)(bc.a*0.3f)},bc);
+                    }
+                }
+            }
+            break;}
+
+        case EffShape::Polygon:{
+            // Regular polygon that morphs, fills, and layers
+            int sides=3+(int)(e.polySides*9.f);
+            int layers=1+(int)(e.trailLen*4.f);
+            float spinOff=(e.motion==EffMotion::Spin)?ph:symAngle;
+            for(int layer=0;layer<layers;++layer){
+                float lf=(float)layer/layers;
+                float r2=sz*(0.2f+lf*0.8f);
+                switch(e.motion){
+                    case EffMotion::Breathe:  r2*=0.7f+0.3f*sinf(ph+lf*2.f); break;
+                    case EffMotion::Explode:  r2*=1.f+trigVal*0.5f*(1.f-lf); break;
+                    case EffMotion::Bounce:   r2*=0.6f+0.4f*fabsf(sinf(ph+lf*2.f)); break;
+                    case EffMotion::Ripple:   r2*=1.f+0.1f*sinf(ph*3.f-lf*6.f); break;
+                    case EffMotion::Converge: r2*=(1.f-lf*trigVal*0.5f); break;
+                    default: break;
+                }
+                // Morph between polygon and circle using density
+                float morphT=e.motion==EffMotion::Drift?0.5f+0.5f*sinf(ph*0.5f):0.f;
+                int segs=sides*4;
+                V2 prev2={0,0}; bool hasPrev=false;
+                for(int s=0;s<=segs;++s){
+                    float ang=(float)s/segs*2*(float)M_PI+spinOff+lf*0.3f;
+                    // Polygon radius at this angle
+                    float polyAng=fmod(ang,2*(float)M_PI/sides);
+                    float polyR=r2*cosf((float)M_PI/sides)/cosf(polyAng-(float)M_PI/sides);
+                    float actualR=polyR*(1.f-morphT)+r2*morphT;
+                    V2 p={rcx+cosf(ang)*actualR, rcy+sinf(ang)*actualR};
+                    if(hasPrev){
+                        SDL_Color col=getColor(ang,actualR,layer*segs+s);
+                        col.a=(Uint8)(col.a*(0.3f+lf*0.7f));
+                        stroke(r,prev2,p,1.f+trigVal*2.f*(1.f-lf*0.5f),col,col);
+                    }
+                    prev2=p; hasPrev=true;
+                }
+            }
+            break;}
+
+        case EffShape::Comet:{
+            // Particles streaming in arcs with bright heads and fading tails
+            int numComets=2+(int)(e.density*8.f);
+            for(int ci=0;ci<numComets;++ci){
+                float cf=(float)ci/numComets;
+                float orbitR=sz*(0.3f+cf*0.7f);
+                float startAng=ph+cf*2.f*(float)M_PI+symAngle;
+                float tailLen=(0.3f+e.trailLen*1.2f)*(float)M_PI;
+                // Apply scatter
+                orbitR*=1.f+e.scatter*0.3f*sinf(ph*3.f+ci*1.7f);
+                int tailSegs=16+(int)(e.trailLen*32.f);
+                V2 prev2={0,0}; bool hp=false;
+                for(int s=0;s<=tailSegs;++s){
+                    float sf=(float)s/tailSegs;
+                    float ang=startAng-tailLen*(1.f-sf);
+                    switch(e.motion){
+                        case EffMotion::Breathe: orbitR*=1.f+0.1f*sinf(ph+cf*2.f); break;
+                        case EffMotion::Swirl:   ang+=sinf(ph+sf*3.f)*0.4f; break;
+                        default: break;
+                    }
+                    V2 p={rcx+cosf(ang)*orbitR, rcy+sinf(ang)*orbitR};
+                    if(hp){
+                        SDL_Color col=getColor(ang,orbitR,ci*tailSegs+s);
+                        col.a=(Uint8)(col.a*sf*(0.5f+trigVal*0.5f));
+                        float w=sf*(1.5f+trigVal*3.f);
+                        stroke(r,prev2,p,w,col,col);
+                    }
+                    prev2=p; hp=true;
+                }
+                // Bright head
+                SDL_Color hc=getColor(startAng,orbitR,ci); hc.a=230;
+                SDL_Rect dot={(int)(rcx+cosf(startAng)*orbitR)-3,(int)(rcy+sinf(startAng)*orbitR)-3,6,6};
+                SDL_SetRenderDrawColor(r,hc.r,hc.g,hc.b,hc.a); SDL_RenderFillRect(r,&dot);
+            }
+            break;}
+
+        case EffShape::Matrix:{
+            // Falling columns of glowing characters (rects)
+            int cols=4+(int)(e.density*12.f);
+            float colW=sz*2.f/cols;
+            for(int col=0;col<cols;++col){
+                float cf=(float)col/cols;
+                // Each column has a different phase offset and speed
+                float colPhase=ph*(1.f+cf*0.3f)+cf*7.3f;
+                float colSpeed=0.5f+cf*0.5f+e.speed*0.5f;
+                int glyphs=3+(int)(e.density*6.f);
+                for(int g=0;g<glyphs;++g){
+                    float gf=(float)g/glyphs;
+                    float yOff=fmod(colPhase*colSpeed+gf,1.f)*sz*2.f-sz;
+                    // Apply scatter
+                    float xOff=(e.scatter>0.01f)?e.scatter*8.f*sinf(colPhase+g*2.3f):0.f;
+                    float bri=1.f-gf*0.7f; // head brightest
+                    SDL_Color col2=getColor(cf*2*(float)M_PI,sz*gf,col*glyphs+g);
+                    col2.a=(Uint8)(col2.a*bri*(0.3f+trigVal*0.7f));
+                    int gx=(int)(rcx-sz+col*colW*2.f+xOff);
+                    int gy=(int)(rcy+yOff);
+                    int gw=(int)(colW*1.6f);
+                    SDL_SetRenderDrawColor(r,col2.r,col2.g,col2.b,col2.a);
+                    SDL_Rect gr={gx,gy,std::max(2,gw),std::max(2,(int)(colW*2.4f))};
+                    SDL_RenderFillRect(r,&gr);
+                }
+            }
+            break;}
+
+        case EffShape::Arc:{
+            // Sweeping arcs that open/close with the music
+            int numArcs=1+(int)(e.density*5.f);
+            for(int ai=0;ai<numArcs;++ai){
+                float af=(float)ai/numArcs;
+                float arcR=sz*(0.2f+af*0.8f)*(1.f+e.innerRadius*0.5f);
+                float arcStart=ph+af*2.f*(float)M_PI/numArcs+symAngle;
+                float sweep=(0.2f+e.waveFreq*1.6f)*(float)M_PI*(1.f+trigVal*0.5f);
+                switch(e.motion){
+                    case EffMotion::Breathe:  arcR*=0.7f+0.3f*sinf(ph+af*2.f); break;
+                    case EffMotion::Explode:  sweep*=1.f+trigVal*0.8f; break;
+                    case EffMotion::PulseM:   arcR*=0.5f+0.5f*fabsf(sinf(ph*(1.f+e.pulseRate*4.f))); break;
+                    case EffMotion::Swirl:    arcStart+=sinf(ph*0.7f+af)*0.8f; break;
+                    case EffMotion::ScatterM: arcStart+=e.scatter*sinf(ph*3.f+af*2.f); break;
+                    default: break;
+                }
+                int segs=24+(int)(e.density*32.f);
+                V2 prev2={0,0}; bool hp=false;
+                for(int s=0;s<=segs;++s){
+                    float ang=arcStart+(float)s/segs*sweep;
+                    V2 p={rcx+cosf(ang)*arcR, rcy+sinf(ang)*arcR};
+                    if(hp){
+                        SDL_Color col=getColor(ang,arcR,ai*segs+s);
+                        float edgeFade=sinf((float)s/segs*(float)M_PI); // fade at tips
+                        col.a=(Uint8)(col.a*edgeFade);
+                        stroke(r,prev2,p,1.f+trigVal*3.f*(1.f-af*0.5f),col,col);
+                    }
+                    prev2=p; hp=true;
+                }
+            }
+            break;}
+
+        default: break;
+        } // end shape switch
+    }; // end drawInstance lambda
+
+    // Draw symmetry copies
+    for(int sym=0;sym<symCopies;++sym){
+        float symAngle=(float)sym/symCopies*2*(float)M_PI;
+        drawInstance(symAngle);
     }
 }
 
+
 void saveCustomEffects(){
     std::ofstream f(g_exeDir+"custom_effects.dat");
-    f<<"EFFECTS "<<g_numCustomEffects<<"\n";
+    f<<"EFFECTS3 "<<g_numCustomEffects<<"\n";
     for(int i=0;i<g_numCustomEffects;++i){
         auto& e=g_customEffects[i];
         f<<e.name<<"\n";
-        f<<(int)e.shape<<" "<<(int)e.color<<" "<<(int)e.motion<<" "<<(int)e.trigger<<"\n";
-        f<<e.hue<<" "<<e.size<<" "<<e.speed<<" "<<e.density<<" "<<e.alpha<<" "<<(int)e.enabled<<"\n";
+        f<<(int)e.shape<<" "<<(int)e.color<<" "<<(int)e.motion<<" "<<(int)e.trigger<<" "<<(int)e.blend<<"\n";
+        f<<e.hue<<" "<<e.hue2<<" "<<e.size<<" "<<e.speed<<" "<<e.density<<" "
+         <<e.alpha<<" "<<e.trailLen<<" "<<e.symmetry<<" "<<e.reactivity<<" "<<(int)e.enabled<<"\n";
+        f<<e.innerRadius<<" "<<e.waveFreq<<" "<<e.polySides<<" "<<e.pulseRate<<" "
+         <<e.colorSpeed<<" "<<e.scatter<<"\n";
     }
 }
 
@@ -2359,23 +2745,36 @@ void loadCustomEffects(){
     if(!f) return;
     std::string line; int n=0;
     if(std::getline(f,line)){
-        std::istringstream ss(line); std::string l; ss>>l>>n;
-        g_numCustomEffects=std::min(n,8);
-    }
-    for(int i=0;i<g_numCustomEffects;++i){
-        auto& e=g_customEffects[i];
-        std::string nm,l1,l2;
-        std::getline(f,nm); e.name=nm;
-        if(std::getline(f,l1)){
-            std::istringstream ss(l1); int sh,co,mo,tr;
-            ss>>sh>>co>>mo>>tr;
-            e.shape=(EffShape)sh; e.color=(EffColor)co;
-            e.motion=(EffMotion)mo; e.trigger=(EffTrigger)tr;
-        }
-        if(std::getline(f,l2)){
-            std::istringstream ss(l2); int en;
-            ss>>e.hue>>e.size>>e.speed>>e.density>>e.alpha>>en;
-            e.enabled=en;
+        std::istringstream ss(line); std::string ver; ss>>ver>>n;
+        bool isV2=(ver=="EFFECTS2"||ver=="EFFECTS3");
+        bool isV3=(ver=="EFFECTS3");
+        g_numCustomEffects=std::min(n,MAX_CUSTOM_EFFECTS);
+        for(int i=0;i<g_numCustomEffects;++i){
+            auto& e=g_customEffects[i];
+            e=CustomEffect{};
+            std::string nm,l1,l2,l3;
+            std::getline(f,nm); e.name=nm;
+            if(std::getline(f,l1)){
+                std::istringstream ss2(l1); int sh,co,mo,tr,bl=0;
+                ss2>>sh>>co>>mo>>tr; if(isV2) ss2>>bl;
+                e.shape  =(EffShape)  std::min(sh,(int)EffShape::COUNT-1);
+                e.color  =(EffColor)  std::min(co,(int)EffColor::COUNT-1);
+                e.motion =(EffMotion) std::min(mo,(int)EffMotion::COUNT-1);
+                e.trigger=(EffTrigger)std::min(tr,(int)EffTrigger::COUNT-1);
+                e.blend  =(EffBlend)  std::min(bl,(int)EffBlend::COUNT-1);
+            }
+            if(std::getline(f,l2)){
+                std::istringstream ss2(l2); int en;
+                if(isV2)
+                    ss2>>e.hue>>e.hue2>>e.size>>e.speed>>e.density>>e.alpha>>e.trailLen>>e.symmetry>>e.reactivity>>en;
+                else
+                    ss2>>e.hue>>e.size>>e.speed>>e.density>>e.alpha>>en;
+                e.enabled=en;
+            }
+            if(isV3&&std::getline(f,l3)){
+                std::istringstream ss2(l3);
+                ss2>>e.innerRadius>>e.waveFreq>>e.polySides>>e.pulseRate>>e.colorSpeed>>e.scatter;
+            }
         }
     }
 }
@@ -3172,10 +3571,13 @@ int playlistClickRow(int mx,int my){
     return row-1;
 }
 bool onProgressBar(int mx,int my,int ww,int wh){
-    return mx>=80&&mx<=ww-80&&my>=wh-28&&my<=wh-4;
+    // matches new layout: pbX=120, pbW=ww-260, barY=wh-26, barH=10
+    int panelH=52, barH=10;
+    int barY=wh-panelH/2-barH/2;
+    return mx>=120&&mx<=ww-140&&my>=barY-4&&my<=barY+barH+4;
 }
 
-// ── BOTTOM NOW-PLAYING BAR — PLASMA EDITION ───────────────────────────────────
+// ── BOTTOM NOW-PLAYING BAR — NEON HUD EDITION ───────────────────────────────
 void drawNowPlayingBar(SDL_Renderer* r, int ww, int wh, Uint8 alpha,
                        float t, float bass, float overall,
                        const std::vector<float>& spec) {
@@ -3186,142 +3588,101 @@ void drawNowPlayingBar(SDL_Renderer* r, int ww, int wh, Uint8 alpha,
     if(dur<=0)dur=1;
     float prog = g_seekDragging ? g_seekPreview : clamp01((float)(pos/dur));
 
-    int barH   = 28;                        // taller bar for plasma room
-    int barY   = wh - barH;
-    int pbX    = 80;
-    int pbW    = ww - 160;
-    int fillW  = (int)(pbW * prog);
+    // Layout
+    int barH  = 10;
+    int panelH = 52;
+    int barY  = wh - panelH/2 - barH/2;
+    int pbX   = 120;
+    int pbW   = ww - 260;
+    int fillW = (int)(pbW * prog);
 
-    // ── Dark background panel ─────────────────────────────────────────────────
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(r, 2, 2, 8, (Uint8)(alpha * 0.92f));
-    SDL_Rect panel={0, barY-16, ww, barH+16};
-    SDL_RenderFillRect(r, &panel);
+    // Time formatter
+    auto fmtTime=[](double s)->std::string{
+        int m=(int)s/60; int sec=(int)s%60;
+        char buf[16]; snprintf(buf,16,"%d:%02d",m,sec); return buf;
+    };
+    std::string elapsed = fmtTime(pos);
+    std::string total   = fmtTime(dur);
 
-    // ── Upward glow bleed into the visualizer ─────────────────────────────────
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
-    int glowH = 16;
-    for(int g=0; g<glowH; ++g){
-        float gf = (float)g/glowH;
-        float ga = (1.f-gf)*(1.f-gf) * (0.06f + bass*0.08f);
-        SDL_Color gc = thsv(fmod(t*18.f, 360.f), 0.8f, 1.f);
-        gc.a = (Uint8)(ga * alpha);
-        SDL_SetRenderDrawColor(r, gc.r, gc.g, gc.b, gc.a);
-        SDL_Rect gline={0, barY-16-g, ww, 1};
-        SDL_RenderFillRect(r, &gline);
-    }
+    float nHue      = g_theme.uiHue;
+    float dragBoost = g_seekDragging ? 1.5f : 1.f;
 
-    // ── Empty bar track ───────────────────────────────────────────────────────
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(r, 15, 15, 30, (Uint8)(alpha*0.9f));
-    SDL_Rect track={pbX, barY+4, pbW, barH-8};
-    SDL_RenderFillRect(r, &track);
+    // ── Dark panel ────────────────────────────────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r,0,0,0,(Uint8)(alpha*0.88f));
+    SDL_Rect panel={0,wh-panelH,ww,panelH};
+    SDL_RenderFillRect(r,&panel);
 
-    // ── PLASMA FILL ───────────────────────────────────────────────────────────
-    // Render column by column — each column gets a plasma height and color
-    // driven by overlapping sine waves at different frequencies
-    if(fillW > 0){
-        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
-        for(int x=0; x<fillW; ++x){
-            float xf = (float)x / pbW;  // 0→1 across filled portion
+    // Thin separator line
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    SDL_Color sepC=hsv(nHue,0.7f,0.4f); sepC.a=(Uint8)(alpha*0.5f);
+    SDL_SetRenderDrawColor(r,sepC.r,sepC.g,sepC.b,sepC.a);
+    SDL_Rect sep={0,wh-panelH,ww,1}; SDL_RenderFillRect(r,&sep);
 
-            // Sample nearby spectrum bin for per-column reactivity
-            int binIdx = std::clamp((int)(xf * 180), 0, FREQ_BINS-1);
-            float binVal = spec[binIdx];
+    // ── Empty track ───────────────────────────────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r,6,8,12,(Uint8)(alpha));
+    SDL_Rect track={pbX,barY,pbW,barH};
+    SDL_RenderFillRect(r,&track);
 
-            // Plasma: sum of sines at different scales and speeds
-            float plasma =
-                sinf(xf * 12.f + t * 2.1f) * 0.28f +
-                sinf(xf * 6.f  - t * 1.4f) * 0.22f +
-                sinf(xf * 24.f + t * 3.7f) * 0.12f +
-                sinf(xf * 3.f  + t * 0.8f) * 0.20f +
-                sinf((xf + t * 0.3f) * 9.f) * 0.18f;
-            // Normalise to 0→1
-            plasma = plasma * 0.5f + 0.5f;
-            // Bass pumps the plasma amplitude
-            plasma = clamp01(plasma * (0.7f + bass * 0.6f + binVal * 0.3f));
+    // ── White fill ────────────────────────────────────────────────────────────
+    if(fillW>0){
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r,220,235,255,(Uint8)(alpha));
+        SDL_Rect fill={pbX,barY,fillW,barH};
+        SDL_RenderFillRect(r,&fill);
 
-            // Hue shifts across the bar length + drifts with time
-            float hue = fmod(xf * 120.f + t * 25.f + bass * 30.f, 360.f);
-            SDL_Color col = thsv(hue, 0.9f, 1.f);
+        // Bass brightness pulse
+        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+        SDL_SetRenderDrawColor(r,255,255,255,(Uint8)(alpha*bass*0.3f));
+        SDL_RenderFillRect(r,&fill);
 
-            // Column height driven by plasma value
-            int colH = (int)((barH - 8) * plasma);
-            int colY = barY + 4 + (barH - 8 - colH);  // anchored to bottom
-
-            // Core column
-            col.a = (Uint8)(alpha * (0.55f + plasma * 0.45f));
-            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
-            SDL_Rect col_rect={pbX + x, colY, 1, colH};
-            SDL_RenderFillRect(r, &col_rect);
-
-            // Bright tip glow at the top of each column
-            SDL_Color tip = thsv(fmod(hue+30.f,360.f), 0.6f, 1.f);
-            tip.a = (Uint8)(alpha * plasma * 0.9f);
-            SDL_SetRenderDrawColor(r, tip.r, tip.g, tip.b, tip.a);
-            SDL_Rect tipR={pbX+x, colY, 1, std::min(3, colH)};
-            SDL_RenderFillRect(r, &tipR);
-        }
-
-        // Soft glow behind the plasma fill
-        for(int g=0; g<8; ++g){
+        // Right edge bloom
+        for(int g=0;g<8;++g){
             float gf=(float)g/8.f;
-            SDL_Color gc=thsv(fmod(t*20.f,360.f),0.7f,1.f);
-            gc.a=(Uint8)(alpha*(1.f-gf)*(1.f-gf)*0.12f*(1.f+bass*0.5f));
+            SDL_Color gc=hsv(nHue,0.6f,1.f);
+            gc.a=(Uint8)(alpha*(1.f-gf)*(1.f-gf)*0.5f*dragBoost);
             SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
-            SDL_Rect gr={pbX-g, barY+4-g, fillW+g*2, barH-8+g*2};
-            SDL_RenderFillRect(r,&gr);
+            SDL_Rect gl={pbX+fillW,barY-1,g+1,barH+2};
+            SDL_RenderFillRect(r,&gl);
         }
     }
+
+    // ── Neon border ───────────────────────────────────────────────────────────
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    for(int g=4;g>=1;--g){
+        SDL_Color gc=hsv(nHue,0.8f,1.f);
+        gc.a=(Uint8)(alpha*(1.f-(float)g/4.f*0.6f)*0.35f*(1.f+bass*0.3f)*dragBoost);
+        SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+        SDL_Rect gr={pbX-g,barY-g,pbW+g*2,barH+g*2};
+        SDL_RenderDrawRect(r,&gr);
+    }
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_Color borderC=hsv(nHue,0.5f,1.f); borderC.a=(Uint8)(alpha*0.9f);
+    SDL_SetRenderDrawColor(r,borderC.r,borderC.g,borderC.b,borderC.a);
+    SDL_RenderDrawRect(r,&track);
 
     // ── Playhead ──────────────────────────────────────────────────────────────
-    int thumbX = pbX + fillW;
-    // Drip glow — wider at top, tapers down
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
-    SDL_Color thumbC = thsv(fmod(t*30.f, 360.f), 0.5f, 1.f);
-    float dragBoost = g_seekDragging ? 2.0f : 1.0f;
-    for(int g=0; g<10; ++g){
-        float gf=(float)g/10.f;
-        thumbC.a=(Uint8)(std::min(255.f, alpha*(1.f-gf)*(1.f-gf)*0.8f*(1.f+bass*0.4f)*dragBoost));
-        SDL_SetRenderDrawColor(r,thumbC.r,thumbC.g,thumbC.b,thumbC.a);
-        SDL_Rect tr={thumbX-g, barY+2, 1+g*2, barH-4};
+    int thumbX=pbX+fillW;
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r,255,255,255,(Uint8)(alpha*dragBoost));
+    SDL_Rect thumbLine={thumbX-1,barY-3,2,barH+6};
+    SDL_RenderFillRect(r,&thumbLine);
+    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+    for(int g=1;g<6;++g){
+        float gf=(float)g/6.f;
+        SDL_Color gc=hsv(nHue,0.5f,1.f);
+        gc.a=(Uint8)(alpha*(1.f-gf)*(1.f-gf)*0.8f*(1.f+bass*0.3f)*dragBoost);
+        SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+        SDL_Rect tr={thumbX-g,barY-2,g*2+1,barH+4};
         SDL_RenderFillRect(r,&tr);
     }
-    // Bright core line
-    thumbC.a = alpha;
-    SDL_SetRenderDrawColor(r, thumbC.r, thumbC.g, thumbC.b, thumbC.a);
-    SDL_Rect thumbLine={thumbX-1, barY+2, 2, barH-4};
-    SDL_RenderFillRect(r, &thumbLine);
 
-    // ── Bar border ────────────────────────────────────────────────────────────
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(r, 40, 40, 80, (Uint8)(alpha*0.4f));
-    SDL_RenderDrawRect(r, &track);
+    // ── Time labels ───────────────────────────────────────────────────────────
+    SDL_Color timeC=hsv(nHue,0.4f,1.f); timeC.a=(Uint8)(alpha*0.9f);
+    drawText(r,g_fontSm,elapsed,pbX-4,barY+barH/2-5,timeC);
+    drawText(r,g_fontSm,total,pbX+pbW+6,barY+barH/2-5,timeC);
 
-    // ── Song title with glitch build animation ────────────────────────────────
-    std::string nowPlaying="No track loaded";
-    if(g_currentSong>=0&&g_currentSong<(int)g_library.size())
-        nowPlaying=g_library[g_currentSong].title;
-    else if(g_music) nowPlaying="Playing...";
-
-    // Glitch type-on using same buildTypeOn as library panels
-    float typeP = clamp01(g_titleBuildT / 0.7f);
-    std::string displayed = buildTypeOn(nowPlaying, typeP, t);
-
-    // Fade in
-    float titleAlpha = smoothstep(clamp01(g_titleBuildT * 3.f));
-    Uint8 ta = (Uint8)(alpha * titleAlpha);
-
-    // Glow behind title — pulses on bass
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
-    float glowHue = fmod(t*18.f, 360.f);
-    SDL_Color tglow = thsv(glowHue, 0.6f, 1.f);
-    tglow.a = (Uint8)(ta * 0.22f * (1.f + bass * 0.4f));
-    for(int g=0;g<3;++g)
-        drawText(r, g_fontSm, displayed, ww/2+g, barY-14, tglow, true);
-    // Crisp title — use smaller font
-    SDL_Color titleC={210, 230, 255, ta};
-    drawText(r, g_fontSm, displayed, ww/2, barY-14, titleC, true);
 }
 
 // New playlist name input overlay — dramatic build
@@ -3354,12 +3715,12 @@ bool drawSlider(SDL_Renderer* r, int x, int y, int w, float val,
     SDL_Color tc=ac; tc.a=(Uint8)(alpha*0.6f);
     SDL_SetRenderDrawColor(r,tc.r,tc.g,tc.b,tc.a);
     SDL_RenderDrawRect(r,&thumb);
-    // Label + value
+    // Label on left, value on right — both above the track
     SDL_Color lc={160,180,220,alpha};
     drawText(r,g_fontSm,label,x,y,lc);
     char vbuf[16]; snprintf(vbuf,16,"%.2f",val);
     SDL_Color vc=ac; vc.a=alpha;
-    drawText(r,g_fontSm,vbuf,x+w+6,y,vc);
+    drawText(r,g_fontSm,vbuf,x+w-28,y,vc); // right-aligned within track width
     return false;
 }
 
@@ -3673,9 +4034,10 @@ void drawThemePanel(SDL_Renderer* r, int ww, int wh, float buildT, float t){
 
                 // Custom effect slots
                 int ceRowH=32;
-                for(int i=0;i<=g_numCustomEffects&&i<8;++i){
-                    int ry=contentY+20+i*ceRowH;
-                    if(ry+ceRowH>wh-100) break;
+                for(int i=g_ceScrollOffset;i<=g_numCustomEffects&&i<MAX_CUSTOM_EFFECTS;++i){
+                    int ry=contentY+20+(i-g_ceScrollOffset)*ceRowH;
+                    int maxListH=std::min((g_numCustomEffects+1)*ceRowH+20,(wh-contentY)/3);
+                    if(ry+ceRowH>contentY+maxListH) break;
                     bool isAdd=(i==g_numCustomEffects);
                     bool isEdit=(i==g_editingEffect);
 
@@ -3713,356 +4075,8 @@ void drawThemePanel(SDL_Renderer* r, int ww, int wh, float buildT, float t){
                     }
                 }
 
-                // Edit panel for selected custom effect
-                if(g_editingEffect>=0&&g_editingEffect<g_numCustomEffects){
-                    auto& ce=g_customEffects[g_editingEffect];
-                    int ey=contentY+20+(g_numCustomEffects+1)*ceRowH+8;
-                    int epH=340; // taller to fit preview
-                    int ctrlW=rightW/2-6; // left: controls
-                    int prevX=rightX+ctrlW+8; // right: preview
-                    int prevW=rightW-ctrlW-12;
-                    int prevH=epH-4;
-
-                    if(ey+epH<wh-40){
-                        // Panel bg
-                        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-                        SDL_SetRenderDrawColor(r,8,18,10,(Uint8)(alpha*0.95f));
-                        SDL_Rect ep={rightX,ey,rightW,epH}; SDL_RenderFillRect(r,&ep);
-                        SDL_Color ebc=hsv(hue,0.5f,0.6f); ebc.a=(Uint8)(alpha*0.6f);
-                        SDL_SetRenderDrawColor(r,ebc.r,ebc.g,ebc.b,ebc.a);
-                        SDL_RenderDrawRect(r,&ep);
-
-                        // Divider between controls and preview
-                        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-                        SDL_Color div=hsv(hue,0.4f,0.4f); div.a=(Uint8)(alpha*0.5f);
-                        SDL_SetRenderDrawColor(r,div.r,div.g,div.b,div.a);
-                        SDL_Rect dvd={prevX-4,ey+2,1,epH-4}; SDL_RenderFillRect(r,&dvd);
-
-                        // ── LEFT: CONTROLS ────────────────────────────────────
-                        // Shape selector
-                        drawText(r,g_fontSm,"SHAPE",rightX+4,ey+4,{100,160,110,alpha});
-                        for(int s=0;s<(int)EffShape::COUNT;++s){
-                            bool sel=(int)ce.shape==s;
-                            SDL_Color sc2=sel?SDL_Color{80,220,100,alpha}:SDL_Color{50,80,60,alpha};
-                            int bx=rightX+4+s*(ctrlW/(int)EffShape::COUNT);
-                            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-                            SDL_SetRenderDrawColor(r,sc2.r/5,sc2.g/5,sc2.b/5,alpha);
-                            SDL_Rect bt={bx,ey+18,ctrlW/(int)EffShape::COUNT-2,18};
-                            SDL_RenderFillRect(r,&bt);
-                            SDL_SetRenderDrawColor(r,sc2.r,sc2.g,sc2.b,sc2.a);
-                            SDL_RenderDrawRect(r,&bt);
-                            drawText(r,g_fontSm,EFF_SHAPE_NAMES[s],bx+2,ey+20,sc2);
-                        }
-                        // Motion selector
-                        drawText(r,g_fontSm,"MOTION",rightX+4,ey+42,{100,160,110,alpha});
-                        for(int m=0;m<(int)EffMotion::COUNT;++m){
-                            bool sel=(int)ce.motion==m;
-                            SDL_Color mc=sel?SDL_Color{80,180,220,alpha}:SDL_Color{40,70,90,alpha};
-                            int bx=rightX+4+m*(ctrlW/(int)EffMotion::COUNT);
-                            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-                            SDL_SetRenderDrawColor(r,mc.r/5,mc.g/5,mc.b/5,alpha);
-                            SDL_Rect bt={bx,ey+56,ctrlW/(int)EffMotion::COUNT-2,18};
-                            SDL_RenderFillRect(r,&bt);
-                            SDL_SetRenderDrawColor(r,mc.r,mc.g,mc.b,mc.a);
-                            SDL_RenderDrawRect(r,&bt);
-                            drawText(r,g_fontSm,EFF_MOTION_NAMES[m],bx+2,ey+58,mc);
-                        }
-                        // Color selector
-                        drawText(r,g_fontSm,"COLOR",rightX+4,ey+80,{100,160,110,alpha});
-                        for(int c2=0;c2<(int)EffColor::COUNT;++c2){
-                            bool sel=(int)ce.color==c2;
-                            SDL_Color cc=sel?SDL_Color{220,180,80,alpha}:SDL_Color{80,70,40,alpha};
-                            int bx=rightX+4+c2*(ctrlW/(int)EffColor::COUNT);
-                            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-                            SDL_SetRenderDrawColor(r,cc.r/5,cc.g/5,cc.b/5,alpha);
-                            SDL_Rect bt={bx,ey+94,ctrlW/(int)EffColor::COUNT-2,18};
-                            SDL_RenderFillRect(r,&bt);
-                            SDL_SetRenderDrawColor(r,cc.r,cc.g,cc.b,cc.a);
-                            SDL_RenderDrawRect(r,&bt);
-                            drawText(r,g_fontSm,EFF_COLOR_NAMES[c2],bx+2,ey+96,cc);
-                        }
-                        // Trigger selector
-                        drawText(r,g_fontSm,"TRIGGER",rightX+4,ey+118,{100,160,110,alpha});
-                        for(int tr=0;tr<(int)EffTrigger::COUNT;++tr){
-                            bool sel=(int)ce.trigger==tr;
-                            SDL_Color tc2=sel?SDL_Color{220,120,220,alpha}:SDL_Color{80,50,80,alpha};
-                            int bx=rightX+4+tr*(ctrlW/(int)EffTrigger::COUNT);
-                            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-                            SDL_SetRenderDrawColor(r,tc2.r/5,tc2.g/5,tc2.b/5,alpha);
-                            SDL_Rect bt={bx,ey+132,ctrlW/(int)EffTrigger::COUNT-2,18};
-                            SDL_RenderFillRect(r,&bt);
-                            SDL_SetRenderDrawColor(r,tc2.r,tc2.g,tc2.b,tc2.a);
-                            SDL_RenderDrawRect(r,&bt);
-                            drawText(r,g_fontSm,EFF_TRIGGER_NAMES[tr],bx+2,ey+134,tc2);
-                        }
-                        // Sliders
-                        SDL_Color sac=hsv(hue,0.8f,1.f); sac.a=alpha;
-                        int sw=ctrlW-8;
-                        drawSlider(r,rightX+4,ey+158,sw,ce.size,   0.f,1.f,"Size",   sac,alpha);
-                        drawSlider(r,rightX+4,ey+192,sw,ce.speed,  0.f,1.f,"Speed",  sac,alpha);
-                        drawSlider(r,rightX+4,ey+226,sw,ce.density,0.f,1.f,"Density",sac,alpha);
-                        drawSlider(r,rightX+4,ey+260,sw,ce.alpha,  0.f,1.f,"Opacity",sac,alpha);
-                        if(ce.color==EffColor::Solid||ce.color==EffColor::Pulse){
-                            drawText(r,g_fontSm,"HUE",rightX+4,ey+295,{100,160,110,alpha});
-                            drawHueBar(r,rightX+28,ey+295,sw-24,10,ce.hue,alpha);
-                        }
-
-                        // ── RIGHT: LIVE PREVIEW ───────────────────────────────
-                        // Dark preview box
-                        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-                        SDL_SetRenderDrawColor(r,3,5,8,(Uint8)(alpha*0.98f));
-                        SDL_Rect pvBox={prevX,ey+2,prevW,prevH};
-                        SDL_RenderFillRect(r,&pvBox);
-
-                        // Label
-                        SDL_Color plc=hsv(hue,0.7f,1.f); plc.a=(Uint8)(alpha*0.7f);
-                        drawText(r,g_fontSm,"PREVIEW",prevX+prevW/2,ey+4,plc,true);
-
-                        // Set clip rect so effect drawing stays inside the box
-                        SDL_Rect clip={prevX+1,ey+18,prevW-2,prevH-20};
-                        SDL_RenderSetClipRect(r,&clip);
-
-                        // Draw the effect centered in the preview box
-                        float pcx = prevX + prevW*0.5f;
-                        float pcy = ey + 18 + (prevH-20)*0.5f;
-                        float pmaxR = std::min(prevW,prevH-20)*0.5f;
-
-                        // Use a temp copy so preview doesn't advance the real phase
-                        CustomEffect preview = ce;
-                        preview.enabled = true;
-                        preview.trigger = EffTrigger::Always; // always show in preview
-                        // Animate preview phase with global time
-                        float previewT = SDL_GetTicks()*0.001f;
-                        preview.phase = fmod(previewT*(0.2f+ce.speed*2.f), 2.f*(float)M_PI);
-
-                        // Draw using ADD blend into the clipped region
-                        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-                        int tmpIdx = -1;
-                        // Temporarily store in a spare slot and draw
-                        // Actually just call drawCustomEffect directly with our preview copy
-                        // Dramatic fake audio — makes motion effects look alive
-                        float fakeBass = 0.5f+0.5f*sinf(previewT*2.3f);
-                        float fakeMid  = 0.5f+0.5f*sinf(previewT*1.7f+1.f);
-                        float fakeHigh = 0.4f+0.4f*sinf(previewT*3.7f+2.f);
-                        float fakeAll  = 0.5f+0.5f*sinf(previewT*1.1f);
-                        // Pick trigVal based on trigger setting
-                        float trigVal=fakeAll;
-                        switch(preview.trigger){
-                            case EffTrigger::Bass:  trigVal=fakeBass; break;
-                            case EffTrigger::Mid:   trigVal=fakeMid;  break;
-                            case EffTrigger::High:  trigVal=fakeHigh; break;
-                            default: break;
-                        }
-
-                        // getColor lambda matching all color modes
-                        auto getColor=[&](float angle2, float r2, int idx2)->SDL_Color{
-                            float h2=0.f;
-                            switch(preview.color){
-                                case EffColor::Spectrum: h2=fmod(angle2*57.3f+previewT*30.f,360.f); break;
-                                case EffColor::Solid:    h2=preview.hue; break;
-                                case EffColor::Pulse:    h2=fmod(preview.hue+sinf(previewT*3.f)*60.f,360.f); break;
-                                case EffColor::Rainbow:  h2=fmod(angle2*57.3f+previewT*40.f,360.f); break;
-                                case EffColor::Fire:     h2=fmod(preview.hue+r2/pmaxR*60.f,60.f); break;
-                                case EffColor::Ice:      h2=fmod(190.f+sinf(angle2+previewT)*20.f,360.f); break;
-                            }
-                            SDL_Color c=thsv(h2,0.9f,1.f);
-                            float ba=preview.alpha*(0.5f+trigVal*0.8f);
-                            c.a=(Uint8)(ba*255.f*smoothstep(clamp01(alpha/220.f)));
-                            return c;
-                        };
-
-                        float ph=preview.phase;
-                        float sz=pmaxR*(0.1f+preview.size*0.9f);
-                        int dens=2+(int)(preview.density*20.f);
-                        auto& e2=preview;
-
-                        switch(e2.shape){
-                            case EffShape::Ring:{
-                                for(int ri=0;ri<std::min(dens,8);++ri){
-                                    float rf=(float)ri/dens;
-                                    float r2=sz*(0.2f+rf*0.8f);
-                                    switch(e2.motion){
-                                        case EffMotion::Breathe: r2*=0.7f+0.3f*sinf(ph+rf*1.5f); break;
-                                        case EffMotion::Explode: r2*=1.f+trigVal*0.5f*sinf(ph+rf); break;
-                                        case EffMotion::Ripple:  r2*=1.f+0.2f*sinf(ph*3.f-rf*8.f); break;
-                                        case EffMotion::Orbit:   r2*=0.6f+0.4f*sinf(ph+rf*2.f); break;
-                                        case EffMotion::Shake:   r2*=1.f+0.12f*sinf(ph*12.f+ri); break;
-                                        default: break;
-                                    }
-                                    float spinOff=(e2.motion==EffMotion::Spin||e2.motion==EffMotion::Drift)?ph*(1.f+rf*0.5f):0.f;
-                                    int segs=20;
-                                    for(int s=0;s<segs;++s){
-                                        float a0=(float)s/segs*2*(float)M_PI+spinOff;
-                                        float a1=(float)(s+1)/segs*2*(float)M_PI+spinOff;
-                                        V2 p0={pcx+cosf(a0)*r2,pcy+sinf(a0)*r2};
-                                        V2 p1={pcx+cosf(a1)*r2,pcy+sinf(a1)*r2};
-                                        stroke(r,p0,p1,1.f+trigVal*2.f,getColor(a0,r2,ri),getColor(a1,r2,ri));
-                                    }
-                                }
-                                break;}
-                            case EffShape::Burst:{
-                                int nSpokes=std::max(4,dens*2);
-                                float spinOff=(e2.motion==EffMotion::Spin)?ph:
-                                              (e2.motion==EffMotion::Drift)?ph*0.3f:0.f;
-                                for(int i=0;i<nSpokes;++i){
-                                    float ang=(float)i/nSpokes*2*(float)M_PI+spinOff;
-                                    float len=sz*0.85f;
-                                    switch(e2.motion){
-                                        case EffMotion::Breathe: len*=0.6f+0.4f*sinf(ph+i); break;
-                                        case EffMotion::Explode: len*=1.f+trigVal*0.7f; break;
-                                        case EffMotion::Ripple:  len*=0.8f+0.2f*sinf(ph*2.f+i*0.7f); break;
-                                        case EffMotion::Orbit:   len*=0.6f+0.4f*sinf(ph+i*2.f/nSpokes*2*(float)M_PI); break;
-                                        case EffMotion::Shake:   len*=1.f+0.2f*sinf(ph*10.f+i); break;
-                                        default: break;
-                                    }
-                                    V2 inner={pcx+cosf(ang)*sz*0.05f,pcy+sinf(ang)*sz*0.05f};
-                                    V2 outer={pcx+cosf(ang)*len,      pcy+sinf(ang)*len};
-                                    SDL_Color c=getColor(ang,len,i);
-                                    SDL_Color c0=c; c0.a=0;
-                                    stroke(r,inner,outer,1.5f+trigVal*2.f,c0,c);
-                                    softCircle(r,outer,2.f+trigVal*4.f,c,{c.r,c.g,c.b,0},6);
-                                }
-                                break;}
-                            case EffShape::Spiral:{
-                                int pts=50;
-                                V2 prev2={pcx,pcy}; bool hasPrev=false;
-                                for(int i=0;i<pts;++i){
-                                    float tf=(float)i/pts;
-                                    float ang=tf*4.f*(float)M_PI*(1.f+e2.speed)+ph;
-                                    float r2=sz*tf;
-                                    switch(e2.motion){
-                                        case EffMotion::Breathe: r2*=0.7f+0.3f*sinf(ph+tf*6.f); break;
-                                        case EffMotion::Explode: r2*=1.f+trigVal*0.4f; break;
-                                        case EffMotion::Ripple:  r2*=1.f+0.15f*sinf(ph*4.f+tf*12.f); break;
-                                        case EffMotion::Shake:   ang+=sinf(ph*8.f+tf*5.f)*0.2f; break;
-                                        default: break;
-                                    }
-                                    V2 p={pcx+cosf(ang)*r2,pcy+sinf(ang)*r2};
-                                    if(hasPrev){ stroke(r,prev2,p,1.f+tf*2.f,getColor(ang,r2,i),getColor(ang,r2,i)); }
-                                    prev2=p; hasPrev=true;
-                                }
-                                break;}
-                            case EffShape::Wave:{
-                                float amp=sz*(0.4f+(e2.motion==EffMotion::Breathe?0.2f*sinf(ph):0.f)
-                                              +(e2.motion==EffMotion::Explode?trigVal*0.3f:0.f));
-                                int pts=60;
-                                V2 prev2={0,0}; bool hasPrev=false;
-                                for(int i=0;i<pts;++i){
-                                    float xf=(float)i/pts;
-                                    float x=pcx-sz+xf*sz*2.f;
-                                    float wy=amp*sinf(xf*(1.f+e2.density*3.f)*2.f*(float)M_PI+ph);
-                                    if(e2.motion==EffMotion::Ripple) wy+=amp*0.3f*sinf(xf*8.f*(float)M_PI-ph*2.f);
-                                    if(e2.motion==EffMotion::Shake) wy+=sinf(ph*10.f+xf*20.f)*sz*0.05f*trigVal;
-                                    V2 p={x,pcy+wy};
-                                    if(hasPrev){ stroke(r,prev2,p,1.5f+trigVal*1.5f,getColor(xf*360.f,fabsf(wy),i),getColor(xf*360.f,fabsf(wy),i)); }
-                                    prev2=p; hasPrev=true;
-                                }
-                                break;}
-                            case EffShape::Grid:{
-                                int rows=2+std::min(dens/4,4);
-                                float spacing=sz*2.f/rows;
-                                for(int row=0;row<rows;++row)
-                                    for(int col=0;col<rows;++col){
-                                        float gx=pcx-sz+col*spacing+spacing*0.5f;
-                                        float gy=pcy-sz+row*spacing+spacing*0.5f;
-                                        float dist=sqrtf((gx-pcx)*(gx-pcx)+(gy-pcy)*(gy-pcy));
-                                        float dotSize=3.f+trigVal*7.f;
-                                        switch(e2.motion){
-                                            case EffMotion::Breathe: dotSize*=0.5f+0.5f*sinf(ph+dist*0.05f); break;
-                                            case EffMotion::Ripple:  dotSize*=0.5f+0.5f*sinf(ph*2.f-dist*0.08f); break;
-                                            case EffMotion::Explode: dotSize*=1.f+trigVal*0.6f; break;
-                                            case EffMotion::Spin:{float ang=atan2f(gy-pcy,gx-pcx)+ph;gx=pcx+cosf(ang)*dist;gy=pcy+sinf(ang)*dist;break;}
-                                            case EffMotion::Shake:   gx+=sinf(ph*8.f+row)*sz*0.05f; gy+=cosf(ph*8.f+col)*sz*0.05f; break;
-                                            default: break;
-                                        }
-                                        float ang=atan2f(gy-pcy,gx-pcx);
-                                        softCircle(r,{gx,gy},dotSize,getColor(ang,dist,row*rows+col),{0,0,0,0},8);
-                                    }
-                                break;}
-                            case EffShape::Star:{
-                                int points=3+(int)(e2.density*7.f);
-                                float spinOff=(e2.motion==EffMotion::Spin)?ph:(e2.motion==EffMotion::Shake)?sinf(ph*8.f)*0.4f:0.f;
-                                float outerR=sz*(0.8f+(e2.motion==EffMotion::Breathe?0.2f*sinf(ph):0.f)+(e2.motion==EffMotion::Explode?trigVal*0.3f:0.f));
-                                float innerR=outerR*0.4f;
-                                for(int p=0;p<points;++p){
-                                    float a0=(float)p/points*2*(float)M_PI+spinOff;
-                                    float a1=(float)(p+0.5f)/points*2*(float)M_PI+spinOff;
-                                    float a2=(float)(p+1)/points*2*(float)M_PI+spinOff;
-                                    V2 tip={pcx+cosf(a0)*outerR,pcy+sinf(a0)*outerR};
-                                    V2 in1={pcx+cosf(a1)*innerR,pcy+sinf(a1)*innerR};
-                                    V2 tip2={pcx+cosf(a2)*outerR,pcy+sinf(a2)*outerR};
-                                    SDL_Color c=getColor(a0,outerR,p);
-                                    SDL_Color c2=c; c2.a=c.a/4;
-                                    stroke(r,tip,in1,1.5f+trigVal*3.f,c2,c);
-                                    stroke(r,in1,tip2,1.5f+trigVal*3.f,c,c2);
-                                    triC(r,{pcx,pcy},in1,tip,c2,c2,c);
-                                    triC(r,{pcx,pcy},tip,in1,c,c2,c2);
-                                }
-                                break;}
-                            case EffShape::Flower:{
-                                int petals=3+(int)(e2.density*7.f);
-                                float petalR=sz*0.4f;
-                                float spinOff=(e2.motion==EffMotion::Spin)?ph:0.f;
-                                float orbitR=sz*(0.3f+(e2.motion==EffMotion::Breathe?0.12f*sinf(ph):0.f)+(e2.motion==EffMotion::Explode?trigVal*0.2f:0.f));
-                                for(int p=0;p<petals;++p){
-                                    float ang=(float)p/petals*2*(float)M_PI+spinOff;
-                                    float pcx2=pcx+cosf(ang)*orbitR;
-                                    float pcy2=pcy+sinf(ang)*orbitR;
-                                    float pr=petalR*(e2.motion==EffMotion::Shake?1.f+0.2f*sinf(ph*8.f+p):1.f);
-                                    SDL_Color c=getColor(ang,orbitR,p);
-                                    for(int s=0;s<16;++s){
-                                        float a0=(float)s/16*2*(float)M_PI;
-                                        float a1=(float)(s+1)/16*2*(float)M_PI;
-                                        stroke(r,{pcx2+cosf(a0)*pr,pcy2+sinf(a0)*pr},{pcx2+cosf(a1)*pr,pcy2+sinf(a1)*pr},1.f+trigVal*2.f,c,c);
-                                    }
-                                }
-                                break;}
-                            case EffShape::Tunnel:{
-                                int rings2=5+(int)(e2.density*6.f);
-                                int sides=3+(int)(e2.density*4.f);
-                                float zoom=fmod(ph*0.5f,1.f);
-                                for(int ri=0;ri<rings2;++ri){
-                                    float rf=((float)ri/rings2+zoom); if(rf>1.f)rf-=1.f;
-                                    float r2=sz*rf*(e2.motion==EffMotion::Breathe?0.8f+0.2f*sinf(ph+ri):1.f);
-                                    float spinOff=(e2.motion==EffMotion::Spin)?ph*(1.f-rf)*2.f:0.f;
-                                    SDL_Color c=getColor(rf*360.f,r2,ri); c.a=(Uint8)(c.a*(1.f-rf*0.7f));
-                                    for(int s=0;s<sides;++s){
-                                        float a0=(float)s/sides*2*(float)M_PI+spinOff;
-                                        float a1=(float)(s+1)/sides*2*(float)M_PI+spinOff;
-                                        stroke(r,{pcx+cosf(a0)*r2,pcy+sinf(a0)*r2},{pcx+cosf(a1)*r2,pcy+sinf(a1)*r2},1.5f+trigVal*2.f*(1.f-rf),c,c);
-                                    }
-                                }
-                                break;}
-                            case EffShape::Lissajous:{
-                                float freqA=1.f+(int)(e2.density*4.f);
-                                float freqB=freqA+(e2.motion==EffMotion::Drift?sinf(ph*0.3f)*2.f:1.f);
-                                float phaseOff=(e2.motion==EffMotion::Spin)?ph:(e2.motion==EffMotion::Ripple)?sinf(ph)*1.5f:(float)M_PI/2.f;
-                                int pts=100;
-                                V2 prev2={0,0}; bool hasPrev=false;
-                                for(int i=0;i<pts+1;++i){
-                                    float tf=(float)i/pts*2*(float)M_PI;
-                                    float ex=sz*0.9f*sinf(freqA*tf+phaseOff);
-                                    float ey3=sz*0.9f*sinf(freqB*tf);
-                                    if(e2.motion==EffMotion::Shake){ex+=sinf(ph*12.f)*sz*0.06f*trigVal;}
-                                    if(e2.motion==EffMotion::Breathe){float sc=0.6f+0.4f*sinf(ph);ex*=sc;ey3*=sc;}
-                                    if(e2.motion==EffMotion::Explode){float sc=0.7f+0.3f+trigVal*0.4f;ex*=sc;ey3*=sc;}
-                                    V2 p={pcx+ex,pcy+ey3};
-                                    if(hasPrev){ float dist=sqrtf(ex*ex+ey3*ey3); stroke(r,prev2,p,1.f+trigVal*2.f,getColor(tf*57.3f,dist,i),getColor(tf*57.3f,dist,i)); }
-                                    prev2=p; hasPrev=true;
-                                }
-                                break;}
-                        }
-                        // Remove clip rect
-                        SDL_RenderSetClipRect(r,nullptr);
-
-                        // Preview border
-                        SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
-                        SDL_Color pbc=hsv(hue,0.6f,0.8f); pbc.a=(Uint8)(alpha*0.4f);
-                        SDL_SetRenderDrawColor(r,pbc.r,pbc.g,pbc.b,pbc.a);
-                        SDL_RenderDrawRect(r,&pvBox);
-                    }
-                }
-            }
+                // Inline edit panel removed — editing is now fullscreen (see g_ceFullscreen draw below)
+            } // end right panel block
 
         } else {
             // ── BACKGROUND TAB ────────────────────────────────────────────────
@@ -4124,6 +4138,218 @@ void drawThemePanel(SDL_Renderer* r, int ww, int wh, float buildT, float t){
             SDL_Color pbc=thsv(hue,0.5f,0.7f); pbc.a=(Uint8)(alpha*0.4f);
             SDL_SetRenderDrawColor(r,pbc.r,pbc.g,pbc.b,pbc.a);
             SDL_RenderDrawRect(r,&prev);
+        }
+
+        // ── FULLSCREEN CUSTOM EFFECT EDITOR ─────────────────────────────────────
+        if(g_ceFullscreen && g_editingEffect>=0 && g_editingEffect<g_numCustomEffects){
+            auto& ce=g_customEffects[g_editingEffect];
+            float cef=smoothstep(clamp01(g_themeEditorT*2.f));
+            Uint8 cAlpha=(Uint8)(cef*240.f);
+
+            // Full dark overlay
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,2,5,8,(Uint8)(cef*248.f));
+            SDL_RenderFillRect(r,nullptr);
+
+            // Scan line build-in
+            float cScan=clamp01((g_themeEditorT-0.05f)/0.3f);
+            if(cScan<1.f){
+                int sy=(int)(cScan*wh);
+                SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+                SDL_Color sc2=hsv(120.f,0.9f,1.f); sc2.a=200;
+                SDL_SetRenderDrawColor(r,sc2.r,sc2.g,sc2.b,sc2.a);
+                SDL_Rect sl={0,sy,ww,2}; SDL_RenderFillRect(r,&sl);
+                for(int gi=1;gi<10;++gi){
+                    SDL_Color gc=sc2; gc.a=(Uint8)(200*(1.f-gi/10.f));
+                    SDL_SetRenderDrawColor(r,gc.r,gc.g,gc.b,gc.a);
+                    SDL_Rect gl={0,sy+gi,ww,1}; SDL_RenderFillRect(r,&gl);
+                }
+            }
+
+            // Header bar
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,6,12,8,(Uint8)(cAlpha*0.97f));
+            SDL_Rect hbar={0,0,ww,52}; SDL_RenderFillRect(r,&hbar);
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color hline=hsv(120.f,0.8f,1.f); hline.a=(Uint8)(cAlpha*0.4f);
+            SDL_SetRenderDrawColor(r,hline.r,hline.g,hline.b,hline.a);
+            SDL_Rect hl={0,51,ww,1}; SDL_RenderFillRect(r,&hl);
+
+            // Title + buttons
+            SDL_Color titleC={180,255,200,cAlpha};
+            drawText(r,g_font,"EFFECT EDITOR  —  "+ce.name,20,16,titleC);
+            SDL_Color doneC={80,220,120,cAlpha};
+            SDL_Color discC={200,80,80,cAlpha};
+            drawText(r,g_font,"[ DONE ]",ww-130,16,doneC);
+            drawText(r,g_font,"[ DISCARD ]",ww-270,16,discC);
+
+            // Layout: left=controls, right=fullscreen live preview
+            int ctrlW=460;          // wider controls column
+            int prevX=ctrlW+16;     // clear gap before preview
+            int prevW=ww-prevX-10;
+            int topY=62;
+            int botY=wh-36;
+            int avH=botY-topY;
+
+            // Controls bg
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,4,10,6,(Uint8)(cAlpha*0.96f));
+            SDL_Rect cbg={0,topY,ctrlW,avH}; SDL_RenderFillRect(r,&cbg);
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color cbdr=hsv(120.f,0.5f,0.5f); cbdr.a=(Uint8)(cAlpha*0.3f);
+            SDL_SetRenderDrawColor(r,cbdr.r,cbdr.g,cbdr.b,cbdr.a);
+            SDL_RenderDrawRect(r,&cbg);
+
+            // Divider
+            SDL_SetRenderDrawColor(r,cbdr.r,cbdr.g,cbdr.b,cbdr.a);
+            SDL_Rect dvd={ctrlW+5,topY,1,avH}; SDL_RenderFillRect(r,&dvd);
+
+            SDL_Color lc2={100,180,120,cAlpha};
+            SDL_Color ac2=hsv(120.f,0.8f,1.f); ac2.a=cAlpha;
+            int cx2=6; // control x
+            int sw2=ctrlW-cx2*2-30; // slider width (leave room for value label)
+            int cy2=topY+6;
+
+            // Helper macro for button rows
+            auto drawBtnRow=[&](const char** names, int count, int selIdx,
+                                SDL_Color selC, SDL_Color offC, int y, int h)->void{
+                int bw=(ctrlW-cx2*2)/count;
+                for(int i=0;i<count;++i){
+                    bool sel=(i==selIdx);
+                    SDL_Color bc3=sel?selC:offC;
+                    SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+                    SDL_SetRenderDrawColor(r,bc3.r/5,bc3.g/5,bc3.b/5,cAlpha);
+                    SDL_Rect bt={cx2+i*bw,y,bw-2,h}; SDL_RenderFillRect(r,&bt);
+                    SDL_SetRenderDrawColor(r,bc3.r,bc3.g,bc3.b,cAlpha);
+                    SDL_RenderDrawRect(r,&bt);
+                    drawText(r,g_fontSm,names[i],cx2+i*bw+2,y+3,bc3);
+                }
+            };
+
+            SDL_Color shapeC={80,220,100,cAlpha}, motC={80,180,220,cAlpha},
+                      colC={220,180,80,cAlpha},   trgC={220,120,220,cAlpha};
+            SDL_Color dimC={50,80,60,cAlpha}, dimM={40,70,90,cAlpha},
+                      dimCol={80,70,40,cAlpha}, dimTrg={80,50,80,cAlpha};
+
+            drawText(r,g_fontSm,"SHAPE",cx2,cy2,lc2); cy2+=14;
+            // Clip controls to left column — prevents text bleeding into preview
+            SDL_RenderSetClipRect(r,&cbg);
+            drawBtnRow(EFF_SHAPE_NAMES,(int)EffShape::COUNT,(int)ce.shape,shapeC,dimC,cy2,16); cy2+=20;
+            drawText(r,g_fontSm,"MOTION",cx2,cy2,lc2); cy2+=14;
+            drawBtnRow(EFF_MOTION_NAMES,(int)EffMotion::COUNT,(int)ce.motion,motC,dimM,cy2,16); cy2+=20;
+            drawText(r,g_fontSm,"COLOR",cx2,cy2,lc2); cy2+=14;
+            drawBtnRow(EFF_COLOR_NAMES,(int)EffColor::COUNT,(int)ce.color,colC,dimCol,cy2,16); cy2+=20;
+            drawText(r,g_fontSm,"TRIGGER",cx2,cy2,lc2); cy2+=14;
+            drawBtnRow(EFF_TRIGGER_NAMES,(int)EffTrigger::COUNT,(int)ce.trigger,trgC,dimTrg,cy2,16); cy2+=24;
+
+            // Sliders — two columns to save vertical space
+            struct Sl{ const char* label; float* val; float mn,mx2; };
+            Sl sliders[]={
+                {"Size",        &ce.size,        0.f,1.f},
+                {"Speed",       &ce.speed,       0.f,1.f},
+                {"Density",     &ce.density,     0.f,1.f},
+                {"Opacity",     &ce.alpha,       0.f,1.f},
+                {"Inner Radius",&ce.innerRadius, 0.f,1.f},
+                {"Wave Freq",   &ce.waveFreq,    0.f,1.f},
+                {"Poly Sides",  &ce.polySides,   0.f,1.f},
+                {"Trail",       &ce.trailLen,    0.f,1.f},
+                {"Symmetry",    &ce.symmetry,    0.f,1.f},
+                {"Reactivity",  &ce.reactivity,  0.f,1.f},
+                {"Scatter",     &ce.scatter,     0.f,1.f},
+                {"Pulse Rate",  &ce.pulseRate,   0.f,1.f},
+                {"Color Speed", &ce.colorSpeed,  0.f,1.f},
+            };
+            int numSl=13;
+            int colsW=(ctrlW-cx2*2)/2-4;
+            for(int si=0;si<numSl;++si){
+                int col=(si%2), row=(si/2);
+                int sx=cx2+col*(colsW+8);
+                int sy2=cy2+row*34;
+                drawSlider(r,sx,sy2,colsW,*sliders[si].val,
+                           sliders[si].mn,sliders[si].mx2,sliders[si].label,ac2,cAlpha);
+            }
+            cy2+=((numSl+1)/2)*34+8;
+
+            // Blend toggle
+            {bool isAdd=(ce.blend==EffBlend::Add);
+             SDL_Color bc3=isAdd?SDL_Color{80,200,255,cAlpha}:SDL_Color{80,160,80,cAlpha};
+             SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+             SDL_SetRenderDrawColor(r,bc3.r/5,bc3.g/5,bc3.b/5,cAlpha);
+             SDL_Rect bt={cx2,cy2,sw2+30,18}; SDL_RenderFillRect(r,&bt);
+             SDL_SetRenderDrawColor(r,bc3.r,bc3.g,bc3.b,cAlpha);
+             SDL_RenderDrawRect(r,&bt);
+             drawText(r,g_fontSm,std::string("BLEND: ")+(isAdd?"ADDITIVE":"NORMAL"),cx2+4,cy2+3,bc3);}
+            cy2+=24;
+
+            // Hue bars (only when relevant)
+            if(ce.color==EffColor::Solid||ce.color==EffColor::Pulse||
+               ce.color==EffColor::Neon ||ce.color==EffColor::Pastel||
+               ce.color==EffColor::Duo  ||ce.color==EffColor::Glitch){
+                drawText(r,g_fontSm,"HUE 1",cx2,cy2,lc2);
+                drawHueBar(r,cx2+46,cy2,sw2-16,12,ce.hue,cAlpha); cy2+=18;
+                drawText(r,g_fontSm,"HUE 2",cx2,cy2,lc2);
+                drawHueBar(r,cx2+46,cy2,sw2-16,12,ce.hue2,cAlpha); cy2+=18;
+            }
+
+            // Clear clip
+            SDL_RenderSetClipRect(r,nullptr);
+
+            // ── RIGHT: FULLSCREEN LIVE PREVIEW ────────────────────────────────
+            // Solid dark fill over the whole preview region first — kills any text bleed
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r,2,5,8,255);
+            SDL_Rect prevBg={prevX,topY,prevW,avH};
+            SDL_RenderFillRect(r,&prevBg);
+
+            float pcx2=(float)(prevX+prevW/2);
+            float pcy2=(float)(topY+avH/2);
+            float pmaxR2=std::min(prevW,avH)*0.45f;
+
+            // Fake audio
+            float previewT=SDL_GetTicks()*0.001f;
+            float fakeBass=0.5f+0.5f*sinf(previewT*2.3f);
+            float fakeMid =0.5f+0.5f*sinf(previewT*1.7f+1.f);
+            float fakeHigh=0.4f+0.4f*sinf(previewT*3.7f+2.f);
+            float fakeAll =0.5f+0.5f*sinf(previewT*1.1f);
+
+            // Advance preview phase for this effect
+            float speedMult=0.2f+ce.speed*2.f;
+            g_customEffects[g_editingEffect].phase=fmod(
+                ce.phase+0.016f*speedMult,2.f*(float)M_PI);
+
+            // Clip to preview region
+            SDL_Rect clip2={prevX,topY,prevW,avH};
+            SDL_RenderSetClipRect(r,&clip2);
+
+            // Draw using the real drawCustomEffect — ALL shapes work automatically
+            // Temporarily force trigger to Always and override position/size
+            EffTrigger savedTrig=ce.trigger;
+            ce.trigger=EffTrigger::Always;
+            // We can't change cx/cy/maxR in drawCustomEffect so we use a fake index
+            // pointing at a modified copy in a spare slot
+            CustomEffect preview=ce;
+            preview.enabled=true;
+            preview.trigger=EffTrigger::Always;
+            preview.phase=ce.phase;
+            // Temporarily write to a scratch slot at MAX_CUSTOM_EFFECTS-1
+            // (safe — we never save that slot)
+            g_customEffects[MAX_CUSTOM_EFFECTS-1]=preview;
+            int savedN=g_numCustomEffects;
+            g_numCustomEffects=MAX_CUSTOM_EFFECTS; // let it draw slot MAX-1
+            drawCustomEffect(r,MAX_CUSTOM_EFFECTS-1,pcx2,pcy2,
+                             previewT,fakeBass,fakeMid,fakeHigh,fakeAll,pmaxR2,{});
+            g_numCustomEffects=savedN;
+            ce.trigger=savedTrig;
+
+            SDL_RenderSetClipRect(r,nullptr);
+
+            // Preview label + border
+            SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_ADD);
+            SDL_Color pbc2=hsv(120.f,0.5f,0.6f); pbc2.a=(Uint8)(cAlpha*0.3f);
+            SDL_SetRenderDrawColor(r,pbc2.r,pbc2.g,pbc2.b,pbc2.a);
+            SDL_RenderDrawRect(r,&clip2);
+            SDL_Color plbl=hsv(120.f,0.7f,1.f); plbl.a=(Uint8)(cAlpha*0.5f);
+            drawText(r,g_fontSm,"LIVE PREVIEW",prevX+prevW/2,topY+6,plbl,true);
         }
 
         // Hint bar at bottom
@@ -5475,17 +5701,17 @@ void renderFrame(SDL_Renderer* ren, RenderParams& rp){
 #define EV(id) if(g_theme.effVisible[id])
     { std::lock_guard<std::mutex> lk(g_particleMtx);
     EV(EFF_MEMBRANE)  drawSubBassMembrane(ren,cx,cy,t,sSub,sBass,maxR,ww,wh);
-                      drawSineWaves(ren,cx,cy,t,sLM,sBass,sAll,ww,wh);
+    EV(EFF_SINE)      drawSineWaves(ren,cx,cy,t,sLM,sBass,sAll,ww,wh);
     float playScale=(g_music&&!g_paused)?0.22f:1.0f;
     EV(EFF_TUNNEL)    drawTunnel(ren,cx,cy,t,sBass*playScale,sAll*playScale,maxR);
-                      drawWormhole(ren,cx,cy,t,sBass*playScale,sMid*playScale,sAll*playScale,maxR);
-                      drawMegaLissajous(ren,cx,cy,t,sMid,sLM,sAll,maxR);
-                      drawFractalBurst(ren,cx,cy,t,sHM,sMid,maxR);
+    EV(EFF_WORMHOLE)  drawWormhole(ren,cx,cy,t,sBass*playScale,sMid*playScale,sAll*playScale,maxR);
+    EV(EFF_LISSAJOUS) drawMegaLissajous(ren,cx,cy,t,sMid,sLM,sAll,maxR);
+    EV(EFF_FRACTAL)   drawFractalBurst(ren,cx,cy,t,sHM,sMid,maxR);
     EV(EFF_NEURAL)    drawNeuralNet(ren,sHigh,sHM,sBass);
     EV(EFF_SHOCKWAVE) drawShockwaves(ren,cx,cy,sBass);
-                      drawBeatCube(ren,cx,cy,t,sBass,sAll);
-    EV(EFF_SPECTRUM) drawSpectrumRing(ren,cx,cy,t,sBass,sMid,sHigh,sAll,spec,maxR);
-                     drawGeoShapes(ren,sBass,sMid,sAll);
+    EV(EFF_CUBE)      drawBeatCube(ren,cx,cy,t,sBass,sAll);
+    EV(EFF_SPECTRUM)  drawSpectrumRing(ren,cx,cy,t,sBass,sMid,sHigh,sAll,spec,maxR);
+    EV(EFF_GEOSHAPES) drawGeoShapes(ren,sBass,sMid,sAll);
     EV(EFF_KALEIDOSCOPE) drawKaleidoscope(ren,cx,cy,sBass,sMid,sHigh,sAll,t,spec,maxR);
     EV(EFF_RIBBON)   drawRibbonTornado(ren,cx,cy,t,sBass,sMid,sAll,maxR);
     EV(EFF_AURORA)   drawAurora(ren,cx,cy,t,sMid,sLM,sAll,ww,wh);
@@ -5568,6 +5794,113 @@ void renderFrame(SDL_Renderer* ren, RenderParams& rp){
         if(g_panel==UIPanel::Library)   drawLibraryPanel(ren,uiAlpha,g_panelBuildT,t);
         if(g_panel==UIPanel::Playlists) drawPlaylistPanel(ren,uiAlpha,g_panelBuildT,t);
         drawNowPlayingBar(ren,ww,wh,uiAlpha,t,sBass,sAll,spec);
+
+        // ── WAVEFORM HOVER POPUP ─────────────────────────────────────────────
+        if(g_wfHovering && (g_wfCache.ready||g_wfCache.building) && uiAlpha>0){
+            int panelH=52, barH=10;
+            int barY=wh-panelH/2-barH/2;
+            int pbX=120, pbW=ww-260;
+
+            // Popup dimensions
+            int popW=320, popH=80;
+            // While dragging, pin popup to seek position not raw mouse X
+            int popAnchorX = g_seekDragging ? (pbX+(int)(g_seekPreview*pbW)) : g_wfMouseX;
+            int popX=std::clamp(popAnchorX-popW/2, 4, ww-popW-4);
+            int popY=barY-popH-12;
+
+            // Dark bg with neon border
+            float nHue=g_theme.uiHue;
+            SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(ren,2,4,8,230);
+            SDL_Rect popBg={popX,popY,popW,popH};
+            SDL_RenderFillRect(ren,&popBg);
+
+            // Border glow
+            SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+            for(int g=3;g>=1;--g){
+                SDL_Color gc=hsv(nHue,0.8f,1.f);
+                gc.a=(Uint8)(uiAlpha*(1.f-(float)g/3.f*0.5f)*0.4f);
+                SDL_SetRenderDrawColor(ren,gc.r,gc.g,gc.b,gc.a);
+                SDL_Rect gb={popX-g,popY-g,popW+g*2,popH+g*2};
+                SDL_RenderDrawRect(ren,&gb);
+            }
+            SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+            SDL_Color bdrC=hsv(nHue,0.5f,1.f); bdrC.a=(Uint8)(uiAlpha*0.8f);
+            SDL_SetRenderDrawColor(ren,bdrC.r,bdrC.g,bdrC.b,bdrC.a);
+            SDL_RenderDrawRect(ren,&popBg);
+
+            // Clip to popup interior
+            SDL_Rect clip={popX+1,popY+1,popW-2,popH-2};
+            SDL_RenderSetClipRect(ren,&clip);
+
+            // Loading spinner while background thread runs
+            if(g_wfCache.building && !g_wfCache.ready){
+                SDL_Color lc=hsv(nHue,0.7f,1.f); lc.a=(Uint8)(uiAlpha*0.7f);
+                drawText(ren,g_fontSm,"scanning...",popX+popW/2,popY+popH/2-6,lc,true);
+                // Animated dots
+                int dotCount=(int)(t*3.f)%4;
+                for(int d=0;d<dotCount;++d){
+                    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+                    SDL_Color dc=hsv(nHue,0.8f,1.f); dc.a=(Uint8)(uiAlpha*0.6f);
+                    SDL_SetRenderDrawColor(ren,dc.r,dc.g,dc.b,dc.a);
+                    SDL_Rect dot={popX+popW/2-20+d*14,popY+popH/2+8,6,6};
+                    SDL_RenderFillRect(ren,&dot);
+                }
+                SDL_RenderSetClipRect(ren,nullptr);
+            }
+
+            // Draw waveform — in a block so the loading goto skips cleanly
+            if(g_wfCache.ready){
+                int wfPad=6;
+                int wfW=popW-wfPad*2;
+                int wfMidY=popY+popH/2;
+                int wfMaxH=(popH/2)-6;
+                SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_ADD);
+                for(int col=0;col<WF_COLS;++col){
+                    float peak=g_wfCache.peaks[col];
+                    int x=popX+wfPad+(int)((float)col/WF_COLS*wfW);
+                    int h=std::max(1,(int)(peak*wfMaxH));
+                    float hue=fmod((float)col/WF_COLS*300.f+nHue,360.f);
+                    SDL_Color wc=hsv(hue,0.9f,1.f);
+                    wc.a=(Uint8)(uiAlpha*0.85f);
+                    SDL_SetRenderDrawColor(ren,wc.r,wc.g,wc.b,wc.a);
+                    SDL_Rect upper={x,wfMidY-h,1,h};
+                    SDL_Rect lower={x,wfMidY,1,h};
+                    SDL_RenderFillRect(ren,&upper);
+                    SDL_RenderFillRect(ren,&lower);
+                }
+                // Playhead line
+                float prog2=clamp01((float)(Mix_GetMusicPosition(g_music))/(float)(Mix_MusicDuration(g_music)));
+                int wfPad2=6, wfW2=popW-wfPad2*2;
+                int phX=popX+wfPad2+(int)(prog2*wfW2);
+                SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+                SDL_SetRenderDrawColor(ren,255,255,255,200);
+                SDL_Rect ph={phX,popY+4,1,popH-8};
+                SDL_RenderFillRect(ren,&ph);
+                // Hover seek line + time label
+                float hoverProg=clamp01((float)(g_wfMouseX-pbX)/pbW);
+                int hpX=popX+wfPad2+(int)(hoverProg*wfW2);
+                SDL_Color hpC=hsv(nHue,0.5f,1.f); hpC.a=160;
+                SDL_SetRenderDrawColor(ren,hpC.r,hpC.g,hpC.b,hpC.a);
+                SDL_Rect hp={hpX,popY+4,1,popH-8};
+                SDL_RenderFillRect(ren,&hp);
+                double hoverSecs=hoverProg*Mix_MusicDuration(g_music);
+                int hm=(int)hoverSecs/60, hs2=(int)hoverSecs%60;
+                char htbuf[16]; snprintf(htbuf,16,"%d:%02d",hm,hs2);
+                SDL_Color htC=hsv(nHue,0.3f,1.f); htC.a=(Uint8)(uiAlpha*0.9f);
+                drawText(ren,g_fontSm,htbuf,popX+popW/2,popY+4,htC,true);
+            }
+
+            SDL_RenderSetClipRect(ren,nullptr);
+
+            // Arrow pointing down to bar
+            SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(ren,bdrC.r,bdrC.g,bdrC.b,bdrC.a);
+            for(int i=0;i<6;++i){
+                SDL_Rect arrow={g_wfMouseX-i,popY+popH+i,i*2+1,1};
+                SDL_RenderFillRect(ren,&arrow);
+            }
+        }
         drawNamingOverlay(ren,ww,wh,uiAlpha,g_namingBuildT,t);
     }
     if(g_spotState!=SpotState::Idle)
@@ -5867,7 +6200,8 @@ if(argc>=2)loadAndPlay(argv[1]);
                 } else {
                     switch(ev.key.keysym.sym){
                         case SDLK_ESCAPE:
-                            if(g_themeEditing){ g_themeEditing=false; g_effScrollOffset=0; }
+                            if(g_ceFullscreen){ g_ceFullscreen=false; g_editingEffect=-1; saveCustomEffects(); }
+                            else if(g_themeEditing){ g_themeEditing=false; g_effScrollOffset=0; }
                             else if(g_themeOpen){ g_themeOpen=false; }
                             else if(g_menuTarget){ toggleMenu(t); }
                             else if(g_panel!=UIPanel::None){ g_panel=UIPanel::None; }
@@ -5924,6 +6258,16 @@ if(argc>=2)loadAndPlay(argv[1]);
                 int mx=ev.motion.x,my=ev.motion.y;
                 g_menuHover = menuHoverTest(mx, my, g_menuOpen);
                 g_hoverSong = libraryClickRow(mx,my);
+                // Waveform hover over progress bar
+                // Keep waveform visible while seek-dragging even if mouse leaves bar
+                g_wfHovering = onProgressBar(mx,my,ww,wh) || g_seekDragging;
+                g_wfMouseX   = mx;
+                if(g_wfHovering && g_currentSong>=0 && g_currentSong<(int)g_library.size()){
+                    if(!g_wfCache.ready || g_wfHoverSong!=g_currentSong){
+                        g_wfHoverSong=g_currentSong;
+                        buildWaveform(g_library[g_currentSong].path);
+                    }
+                }
                 // Update active slider drag
                 if(g_themeDragSlider>=0 && g_themeDragVal){
                     *g_themeDragVal=g_themeDragMin+(g_themeDragMax-g_themeDragMin)*
@@ -5944,7 +6288,7 @@ if(argc>=2)loadAndPlay(argv[1]);
                 }
                 // Update seek preview while dragging
                 if(g_seekDragging)
-                    g_seekPreview=clamp01((float)(mx-80)/(ww-160));
+                    g_seekPreview=clamp01((float)(mx-120)/(ww-260));
                 // Spotify playlist hover
                 if(g_spotState==SpotState::PlaylistPicker){
                     int ox=10,oy=80,ow=360,listY=oy+30;
@@ -5971,6 +6315,82 @@ if(argc>=2)loadAndPlay(argv[1]);
                         if(row>=0&&row<VISIBLE_ROWS&&idx<(int)g_spotPlaylists.size())
                             spotSelectPlaylist(idx);
                     }
+                }
+
+                // Fullscreen custom effect editor clicks (highest priority — covers screen)
+                if(g_ceFullscreen && g_editingEffect>=0 && g_editingEffect<g_numCustomEffects){
+                    auto& ce=g_customEffects[g_editingEffect];
+                    int ctrlW2=460, cx2=6, topY2=62;
+                    int sw2=ctrlW2-cx2*2-30;
+                    int cy2=topY2+6;
+
+                    // Helper — start a drag on any float* using global drag state
+                    auto ceDrag=[&](float* val,float mn,float mx2,int tx,int tw){
+                        g_themeDragVal=val; g_themeDragMin=mn; g_themeDragMax=mx2;
+                        g_themeDragX=tx;   g_themeDragW=tw;  g_themeDragSlider=1;
+                        *val=mn+(mx2-mn)*clamp01((float)(mx-tx)/tw);
+                    };
+
+                    // Done / Discard buttons
+                    if(my>=10&&my<=42&&mx>=ww-130&&mx<=ww-10){
+                        g_ceFullscreen=false; g_editingEffect=-1; saveCustomEffects();
+                    } else if(my>=10&&my<=42&&mx>=ww-270&&mx<=ww-140){
+                        g_ceFullscreen=false; g_editingEffect=-1;
+                    } else {
+                        // Button rows
+                        int bwShape=(ctrlW2-cx2*2)/(int)EffShape::COUNT;
+                        int bwMotion=(ctrlW2-cx2*2)/(int)EffMotion::COUNT;
+                        int bwColor=(ctrlW2-cx2*2)/(int)EffColor::COUNT;
+                        int bwTrig=(ctrlW2-cx2*2)/(int)EffTrigger::COUNT;
+                        for(int i=0;i<(int)EffShape::COUNT;++i)
+                            if(mx>=cx2+i*bwShape&&mx<=cx2+i*bwShape+bwShape-2&&my>=cy2+14&&my<=cy2+30)
+                                ce.shape=(EffShape)i;
+                        cy2+=34;
+                        for(int i=0;i<(int)EffMotion::COUNT;++i)
+                            if(mx>=cx2+i*bwMotion&&mx<=cx2+i*bwMotion+bwMotion-2&&my>=cy2+14&&my<=cy2+30)
+                                ce.motion=(EffMotion)i;
+                        cy2+=34;
+                        for(int i=0;i<(int)EffColor::COUNT;++i)
+                            if(mx>=cx2+i*bwColor&&mx<=cx2+i*bwColor+bwColor-2&&my>=cy2+14&&my<=cy2+30)
+                                ce.color=(EffColor)i;
+                        cy2+=34;
+                        for(int i=0;i<(int)EffTrigger::COUNT;++i)
+                            if(mx>=cx2+i*bwTrig&&mx<=cx2+i*bwTrig+bwTrig-2&&my>=cy2+14&&my<=cy2+30)
+                                ce.trigger=(EffTrigger)i;
+                        cy2+=38;
+
+                        // Sliders — two columns
+                        float* sv[]={&ce.size,&ce.speed,&ce.density,&ce.alpha,
+                                     &ce.innerRadius,&ce.waveFreq,&ce.polySides,
+                                     &ce.trailLen,&ce.symmetry,&ce.reactivity,&ce.scatter,
+                                     &ce.pulseRate,&ce.colorSpeed};
+                        int colsW=(ctrlW2-cx2*2)/2-4;
+                        for(int si=0;si<13;++si){
+                            int col=si%2, row=si/2;
+                            int sx=cx2+col*(colsW+8);
+                            int sy2=cy2+row*34+14;
+                            if(mx>=sx&&mx<=sx+colsW&&my>=sy2&&my<=sy2+16)
+                                ceDrag(sv[si],0.f,1.f,sx,colsW);
+                        }
+                        cy2+=((13+1)/2)*34+8;
+
+                        // Blend toggle
+                        if(mx>=cx2&&mx<=cx2+sw2+30&&my>=cy2&&my<=cy2+18)
+                            ce.blend=(ce.blend==EffBlend::Add)?EffBlend::Normal:EffBlend::Add;
+                        cy2+=24;
+
+                        // Hue bars
+                        if(ce.color==EffColor::Solid||ce.color==EffColor::Pulse||
+                           ce.color==EffColor::Neon ||ce.color==EffColor::Pastel||
+                           ce.color==EffColor::Duo  ||ce.color==EffColor::Glitch){
+                            if(my>=cy2&&my<=cy2+12&&mx>=cx2+46&&mx<=cx2+46+sw2-16)
+                                ceDrag(&ce.hue,0.f,360.f,cx2+46,sw2-16);
+                            if(my>=cy2+18&&my<=cy2+30&&mx>=cx2+46&&mx<=cx2+46+sw2-16)
+                                ceDrag(&ce.hue2,0.f,360.f,cx2+46,sw2-16);
+                        }
+                        saveCustomEffects();
+                    }
+                    goto skip_all_other_clicks;
                 }
 
                 // Theme panel clicks
@@ -6076,12 +6496,14 @@ if(argc>=2)loadAndPlay(argv[1]);
                                     }
                                     // RIGHT — custom effect builder
                                     int ceRowH=32;
-                                    for(int i=0;i<=g_numCustomEffects&&i<8;++i){
-                                        int ry=contentY+20+i*ceRowH;
+                                    for(int i=g_ceScrollOffset;i<=g_numCustomEffects&&i<MAX_CUSTOM_EFFECTS;++i){
+                                        int ry=contentY+20+(i-g_ceScrollOffset)*ceRowH;
+                                        int maxListH2=std::min((g_numCustomEffects+1)*ceRowH+20,(wh-contentY)/3);
+                                        if(ry+ceRowH>contentY+maxListH2) break;
                                         bool isAdd=(i==g_numCustomEffects);
                                         if(mx>=rightX&&mx<=rightX+rightW&&my>=ry&&my<=ry+ceRowH-2){
                                             if(isAdd){
-                                                if(g_numCustomEffects<8){
+                                                if(g_numCustomEffects<MAX_CUSTOM_EFFECTS){
                                                     g_customEffects[g_numCustomEffects]={};
                                                     g_customEffects[g_numCustomEffects].name="Effect "+std::to_string(g_numCustomEffects+1);
                                                     g_customEffects[g_numCustomEffects].enabled=true;
@@ -6091,73 +6513,31 @@ if(argc>=2)loadAndPlay(argv[1]);
                                                     g_customEffects[g_numCustomEffects].alpha=0.7f;
                                                     g_editingEffect=g_numCustomEffects;
                                                     g_numCustomEffects++;
+                                                    g_ceFullscreen=true;
                                                 }
                                             } else {
                                                 // ON/OFF
-                                                if(mx<=rightX+34) g_customEffects[i].enabled=!g_customEffects[i].enabled;
+                                                if(mx<=rightX+34){
+                                                    g_customEffects[i].enabled=!g_customEffects[i].enabled;
+                                                    saveCustomEffects();
+                                                }
                                                 // Edit
                                                 else if(mx>=rightX+rightW-80&&my<=ry+ceRowH/2)
-                                                    g_editingEffect=(g_editingEffect==i)?-1:i;
+                                                    if(g_editingEffect==i){ g_editingEffect=-1; g_ceFullscreen=false; }
+                                                    else { g_editingEffect=i; g_ceFullscreen=true; }
                                                 // Delete
                                                 else if(mx>=rightX+rightW-44&&my>ry+ceRowH/2){
                                                     for(int j=i;j<g_numCustomEffects-1;++j)
                                                         g_customEffects[j]=g_customEffects[j+1];
                                                     g_numCustomEffects--;
-                                                    if(g_editingEffect>=g_numCustomEffects) g_editingEffect=-1;
+                                                    if(g_editingEffect>=g_numCustomEffects){ g_editingEffect=-1; g_ceFullscreen=false; }
+                                                    saveCustomEffects();
                                                 }
                                             }
                                         }
                                     }
-                                    // Edit panel interactions
-                                    if(g_editingEffect>=0&&g_editingEffect<g_numCustomEffects){
-                                        auto& ce=g_customEffects[g_editingEffect];
-                                        int ey=contentY+20+(g_numCustomEffects+1)*ceRowH+8;
-                                        int ctrlW=rightW/2-6;
-                                        if(ey+340<wh-40){
-                                            // Shape buttons
-                                            for(int s=0;s<(int)EffShape::COUNT;++s){
-                                                int bx=rightX+4+s*(ctrlW/(int)EffShape::COUNT);
-                                                int bw=ctrlW/(int)EffShape::COUNT-2;
-                                                if(mx>=bx&&mx<=bx+bw&&my>=ey+18&&my<=ey+36)
-                                                    ce.shape=(EffShape)s;
-                                            }
-                                            // Motion buttons
-                                            for(int m=0;m<(int)EffMotion::COUNT;++m){
-                                                int bx=rightX+4+m*(ctrlW/(int)EffMotion::COUNT);
-                                                int bw=ctrlW/(int)EffMotion::COUNT-2;
-                                                if(mx>=bx&&mx<=bx+bw&&my>=ey+56&&my<=ey+74)
-                                                    ce.motion=(EffMotion)m;
-                                            }
-                                            // Color buttons
-                                            for(int c2=0;c2<(int)EffColor::COUNT;++c2){
-                                                int bx=rightX+4+c2*(ctrlW/(int)EffColor::COUNT);
-                                                int bw=ctrlW/(int)EffColor::COUNT-2;
-                                                if(mx>=bx&&mx<=bx+bw&&my>=ey+94&&my<=ey+112)
-                                                    ce.color=(EffColor)c2;
-                                            }
-                                            // Trigger buttons
-                                            for(int tr=0;tr<(int)EffTrigger::COUNT;++tr){
-                                                int bx=rightX+4+tr*(ctrlW/(int)EffTrigger::COUNT);
-                                                int bw=ctrlW/(int)EffTrigger::COUNT-2;
-                                                if(mx>=bx&&mx<=bx+bw&&my>=ey+132&&my<=ey+150)
-                                                    ce.trigger=(EffTrigger)tr;
-                                            }
-                                            // Sliders — all in left column
-                                            int sw=ctrlW-8;
-                                            float* sv[]={&ce.size,&ce.speed,&ce.density,&ce.alpha};
-                                            int slY2[]={ey+158,ey+192,ey+226,ey+260};
-                                            for(int s=0;s<4;++s){
-                                                if(mx>=rightX+4&&mx<=rightX+4+sw&&my>=slY2[s]+10&&my<=slY2[s]+26)
-                                                    startDrag(sv[s],0.f,1.f,rightX+4,sw);
-                                            }
-                                            // Hue bar
-                                            if(ce.color==EffColor::Solid||ce.color==EffColor::Pulse){
-                                                if(my>=ey+295&&my<=ey+308&&mx>=rightX+28&&mx<=rightX+28+sw-24)
-                                                    startDrag(&ce.hue,0.f,360.f,rightX+28,sw-24);
-                                            }
-                                        }
-                                        saveCustomEffects();
-                                    }
+                                    // Edit panel now fullscreen — clicks handled outside theme editor block
+                                    (void)0;
                                 } else {
                                     // Gradient toggle
                                     if(mx>=col1&&mx<=col1+120&&my>=contentY&&my<=contentY+28)
@@ -6180,10 +6560,11 @@ if(argc>=2)loadAndPlay(argv[1]);
                     }
                 }
 
+                skip_all_other_clicks:;
                 // Progress bar — start drag (not while theme editor open)
                 if(!g_themeEditing && onProgressBar(mx,my,ww,wh)&&g_music){
                     g_seekDragging=true;
-                    g_seekPreview=clamp01((float)(mx-80)/(ww-160));
+                    g_seekPreview=clamp01((float)(mx-120)/(ww-260));
                 }
 
                 // Check menu trigger button
