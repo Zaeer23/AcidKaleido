@@ -4866,62 +4866,64 @@ bool spotFetchTracks(const std::string& playlistId, int total){
         std::string resp=httpsGet("api.spotify.com",path,auth);
         if(resp.empty()) break;
 
-        // JSON structure per track (artists comes BEFORE name):
-        // {"track":{"artists":[{"name":"ARTIST"}],"name":"TITLE"}}
+        // JSON: {"track":{"artists":[{"name":"ARTIST"}],"name":"TITLE"}}
+        // "track" can be null for local/deleted tracks — skip those
+        auto extractStr=[&](const std::string& src, size_t from)->std::pair<std::string,size_t>{
+            size_t q=src.find('"',from);
+            if(q==std::string::npos) return {"",std::string::npos};
+            ++q; std::string out;
+            while(q<src.size()&&src[q]!='"'){
+                if(src[q]=='\\' &&q+1<src.size()) ++q;
+                out+=src[q++];
+            }
+            return {out,q+1};
+        };
+
         size_t pos=0;
         while(true){
             size_t trackPos=resp.find("\"track\":",pos);
             if(trackPos==std::string::npos) break;
             pos=trackPos+8;
+            // skip whitespace
+            while(pos<resp.size()&&resp[pos]==' ') ++pos;
+            // null track = deleted/local song — skip it
+            if(pos+3<resp.size()&&resp.substr(pos,4)=="null"){ pos+=4; continue; }
 
-            // Find the artists array for this track
-            size_t artistsPos=resp.find("\"artists\":",pos);
-            // Find the track name (comes AFTER artists in this JSON)
-            size_t namePos=resp.find("\"name\":",pos);
+            // Grab the track object by walking braces (cap at 2048 chars)
+            size_t objOpen=resp.find('{',pos);
+            if(objOpen==std::string::npos) break;
+            int depth=0; size_t objClose=objOpen;
+            for(size_t k=objOpen;k<resp.size()&&k<objOpen+2048;++k){
+                if(resp[k]=='{') ++depth;
+                else if(resp[k]=='}'){ --depth; if(!depth){objClose=k;break;} }
+            }
+            std::string obj=resp.substr(objOpen,objClose-objOpen+1);
+            pos=objClose+1;
 
-            if(artistsPos==std::string::npos||namePos==std::string::npos) continue;
-
-            // Extract first artist from inside [...] 
+            // Artist — inside the artists:[...] array
             std::string artist;
-            size_t arrOpen=resp.find('[',artistsPos);
-            size_t arrClose=resp.find(']',arrOpen!=std::string::npos?arrOpen:artistsPos);
-            if(arrOpen!=std::string::npos){
-                size_t anPos=resp.find("\"name\":",arrOpen);
-                if(anPos!=std::string::npos&&
-                   (arrClose==std::string::npos||anPos<arrClose)){
-                    size_t ap=anPos+7;
-                    while(ap<resp.size()&&resp[ap]!='"') ++ap;
-                    if(ap<resp.size()){
-                        ++ap;
-                        while(ap<resp.size()&&resp[ap]!='"'){
-                            if(resp[ap]=='\\'&&ap+1<resp.size()){++ap;}
-                            artist+=resp[ap++];
-                        }
-                    }
+            size_t aPos=obj.find("\"artists\":");
+            if(aPos!=std::string::npos){
+                size_t aOpen=obj.find('[',aPos);
+                size_t aClose=obj.find(']',aOpen!=std::string::npos?aOpen:aPos);
+                if(aOpen!=std::string::npos){
+                    size_t nPos=obj.find("\"name\":",aOpen);
+                    if(nPos!=std::string::npos&&(aClose==std::string::npos||nPos<aClose))
+                        artist=extractStr(obj,nPos+8).first;
                 }
             }
 
-            // Track "name" comes after the closing ] of artists array
-            // Find the "name" field AFTER the artists array closes
-            size_t trackNamePos=resp.find("\"name\":",
-                arrClose!=std::string::npos?arrClose:artistsPos);
-            if(trackNamePos==std::string::npos) continue;
-
+            // Track name — find "name": that comes AFTER the artists array closes
             std::string title;
-            size_t tp=trackNamePos+7;
-            while(tp<resp.size()&&resp[tp]!='"') ++tp;
-            if(tp<resp.size()){
-                ++tp;
-                while(tp<resp.size()&&resp[tp]!='"'){
-                    if(resp[tp]=='\\'&&tp+1<resp.size()){++tp;}
-                    title+=resp[tp++];
-                }
-            }
+            size_t searchFrom=obj.find(']', obj.find("\"artists\":"));
+            if(searchFrom==std::string::npos) searchFrom=0;
+            size_t tnPos=obj.find("\"name\":",searchFrom);
+            if(tnPos!=std::string::npos)
+                title=extractStr(obj,tnPos+8).first;
 
             if(!title.empty()){
                 SpotTrack tr;
-                tr.title=title;
-                tr.artist=artist;
+                tr.title=title; tr.artist=artist;
                 tr.searchQuery=artist.empty()?title:artist+" - "+title;
                 tr.status="waiting";
                 g_spotTracks.push_back(tr);
